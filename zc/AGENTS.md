@@ -17,7 +17,7 @@ This file describes how to work on `zc/` safely and consistently.
 ## Build expectations
 
 - `make` must build both `zc` and `zc-kilo`.
-- `make cosmo` currently targets `zc.com` only.
+- `make cosmo` is intended to build both `zc.com` and `zc-kilo.com`.
 - Avoid introducing dependencies on `glib`, `ncurses`, `slang`, or other heavy runtime libraries.
 
 ## License guardrail
@@ -50,6 +50,14 @@ This file describes how to work on `zc/` safely and consistently.
 - No archive browsing.
 - No menu bar or user menu on `F2` / `F9`.
 - No separate internal editor/viewer beyond launching `zc-kilo`.
+
+## Cosmopolitan bundle policy
+
+- Treat the Cosmopolitan distribution as a two-file bundle:
+  - `zc.com`
+  - `zc-kilo.com`
+- In Cosmopolitan mode, keep editor lookup deterministic: use the sibling `zc-kilo.com`.
+- Do not add a silent PATH fallback for the Cosmopolitan runtime path.
 
 ## Validation
 

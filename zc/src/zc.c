@@ -25,6 +25,14 @@
 #define PATH_MAX 4096
 #endif
 
+#if defined(__COSMOPOLITAN__)
+#define ZC_BUNDLED_KILO_NAME      "zc-kilo.com"
+#define ZC_FORCE_BUNDLED_EDITOR   1
+#else
+#define ZC_BUNDLED_KILO_NAME      "zc-kilo"
+#define ZC_FORCE_BUNDLED_EDITOR   0
+#endif
+
 #define ZC_VERSION "0.1.0"
 #define STATUS_LEN 256
 #define PROMPT_LEN PATH_MAX
@@ -104,6 +112,7 @@ static App g_app;
 
 static bool join_path (char *dst, size_t dst_size, const char *dir, const char *name);
 static bool resolve_existing_path (char *dst, size_t dst_size, const char *path);
+static bool resolve_executable_dir (const char *argv0, char *dst, size_t dst_size);
 static void panel_move_selection (Panel *panel, int delta);
 
 static void
@@ -437,6 +446,15 @@ copy_string (char *dst, size_t dst_size, const char *src)
 }
 
 static bool
+compute_sibling_path (const char *argv0, const char *binary_name, char *dst, size_t dst_size)
+{
+    char exec_dir[PATH_MAX];
+
+    return resolve_executable_dir (argv0, exec_dir, sizeof (exec_dir))
+           && join_path (dst, dst_size, exec_dir, binary_name);
+}
+
+static bool
 find_executable_in_path (const char *name, char *dst, size_t dst_size)
 {
     const char *path_env;
@@ -518,17 +536,18 @@ resolve_executable_dir (const char *argv0, char *dst, size_t dst_size)
 static bool
 discover_default_kilo (const char *argv0, char *dst, size_t dst_size)
 {
-    char exec_dir[PATH_MAX];
     char sibling[PATH_MAX];
 
-    if (resolve_executable_dir (argv0, exec_dir, sizeof (exec_dir))
-        && join_path (sibling, sizeof (sibling), exec_dir, "zc-kilo")
-        && access (sibling, X_OK) == 0
-        && copy_string (dst, dst_size, sibling))
+    if (compute_sibling_path (argv0, ZC_BUNDLED_KILO_NAME, sibling, sizeof (sibling)))
     {
-        return true;
+        if (ZC_FORCE_BUNDLED_EDITOR)
+            return copy_string (dst, dst_size, sibling);
+        if (access (sibling, X_OK) == 0 && copy_string (dst, dst_size, sibling))
+            return true;
     }
 
+    if (ZC_FORCE_BUNDLED_EDITOR)
+        return copy_string (dst, dst_size, ZC_BUNDLED_KILO_NAME);
     return copy_string (dst, dst_size, "kilo");
 }
 
@@ -909,7 +928,12 @@ truncate_name (char *dst, size_t dst_size, const char *src, bool is_dir)
 
     if (needed + 1 <= dst_size)
     {
-        snprintf (dst, dst_size, "%s%s", src, is_dir ? "/" : "");
+        copy_string (dst, dst_size, src);
+        if (is_dir)
+        {
+            dst[src_len] = '/';
+            dst[src_len + 1] = '\0';
+        }
         return;
     }
 
@@ -1309,6 +1333,12 @@ spawn_kilo (const char *path, bool readonly)
     pid_t pid;
     int status;
 
+    if (ZC_FORCE_BUNDLED_EDITOR && access (g_app.kilo_cmd, X_OK) != 0)
+    {
+        set_status ("Bundled editor not found: %s", g_app.kilo_cmd);
+        return false;
+    }
+
     disable_raw_mode ();
     clear_screen ();
     fflush (stdout);
@@ -1602,7 +1632,8 @@ delete_selection (void)
             return;
         }
 
-        snprintf (question, sizeof (question), "Delete %s?", entry_name);
+        snprintf (question, sizeof (question), "Delete %.*s?",
+                  (int) (sizeof (question) - sizeof ("Delete ?")), entry_name);
         if (!prompt_confirm (question))
         {
             free (indexes);
@@ -1932,11 +1963,15 @@ init_app (const char *argv0)
 
     memset (&g_app, 0, sizeof (g_app));
     g_app.running = true;
-    if (kilo_env != NULL && kilo_env[0] != '\0')
+
+    if (!ZC_FORCE_BUNDLED_EDITOR && kilo_env != NULL && kilo_env[0] != '\0')
         copy_string (g_app.kilo_cmd, sizeof (g_app.kilo_cmd), kilo_env);
     else
         discover_default_kilo (argv0, g_app.kilo_cmd, sizeof (g_app.kilo_cmd));
-    set_status ("Ready. kilo command: %s", g_app.kilo_cmd);
+    if (ZC_FORCE_BUNDLED_EDITOR)
+        set_status ("Ready. bundled editor: %s", g_app.kilo_cmd);
+    else
+        set_status ("Ready. kilo command: %s", g_app.kilo_cmd);
 }
 
 int

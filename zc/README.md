@@ -33,7 +33,12 @@
 
 When one or more entries are marked, copy, move, and delete operate on the full marked set. Without marks, they operate on the current entry only.
 
-`zc` prefers a sibling `zc-kilo` binary that is built from the vendored upstream `antirez/kilo` source in `third_party/kilo/`. You can still override the editor with `ZC_KILO=/path/to/editor`.
+`zc` prefers a sibling bundled editor built from the vendored upstream `antirez/kilo` source in `third_party/kilo/`.
+
+- native/local build: sibling `zc-kilo`
+- Cosmopolitan build: sibling `zc-kilo.com`
+
+For the native build you can still override the editor with `ZC_KILO=/path/to/editor`. In Cosmopolitan mode the runtime expects the sibling bundled editor and does not fall back to `PATH`.
 
 ## License
 
@@ -87,7 +92,12 @@ cd zc
 make cosmo COSMOCC=cosmocc
 ```
 
-At the moment `make cosmo` builds `zc.com` only. The bundled `zc-kilo` path is set up for the normal local build and still needs a dedicated Cosmopolitan packaging pass.
+This is intended to build:
+
+- `./zc.com`
+- `./zc-kilo.com`
+
+The Cosmopolitan distribution is a two-file bundle. `zc.com` expects `zc-kilo.com` in the same directory.
 
 ## Run
 
@@ -97,7 +107,7 @@ At the moment `make cosmo` builds `zc.com` only. The bundled `zc-kilo` path is s
 ./zc --left /tmp --right "$HOME"
 ```
 
-Set `ZC_KILO` if you want to override the bundled editor:
+Set `ZC_KILO` if you want to override the bundled editor in the native build:
 
 ```sh
 ZC_KILO=/path/to/kilo ./zc

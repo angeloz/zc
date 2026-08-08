@@ -41,7 +41,12 @@ Current local integration changes are minimal:
 - support `--readonly`
 - minor build cleanup for vendored use
 
-At runtime, `zc` looks for a sibling `zc-kilo` next to the `zc` binary first. If needed, the editor command can be overridden with `ZC_KILO`.
+At runtime, `zc` uses a sibling bundled editor by default.
+
+- native/local build: sibling `zc-kilo`, with optional `ZC_KILO` override
+- Cosmopolitan build: sibling `zc-kilo.com`, with no fallback to `PATH`
+
+If the required sibling bundled editor is missing in Cosmopolitan mode, `zc` should fail clearly instead of silently choosing a different editor.
 
 ## License
 
@@ -107,7 +112,7 @@ Current bulk-aware actions:
 - no archive browsing
 - no background jobs
 - no native internal viewer/editor separate from `zc-kilo`
-- no dedicated Cosmopolitan packaging yet for bundled `zc-kilo`
+- Cosmopolitan validation still depends on having `cosmocc` available in the build environment
 
 ## Build and distribution
 
@@ -130,11 +135,16 @@ cd zc
 make cosmo COSMOCC=cosmocc
 ```
 
-At the moment this builds `zc.com` only. Extending the same distribution model to the bundled editor is still open work.
+This build path is intended to produce:
+
+- `zc.com`
+- `zc-kilo.com`
+
+The expected deployment model is a two-file bundle in one directory, with `zc.com` launching the sibling `zc-kilo.com`.
 
 ## Suggested next steps
 
 - decide what `F2` should become, if anything
 - decide whether `F9` should remain unimplemented or gain a minimal menu
-- define a packaging strategy for `zc.com` plus bundled editor under Cosmopolitan
+- validate the two-file Cosmopolitan bundle on actual target systems once `cosmocc` is available
 - consider a clearer status line for marked-count and current operation results
