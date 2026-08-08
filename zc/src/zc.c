@@ -104,6 +104,8 @@ typedef struct
     int active_panel;
     bool running;
     char status[STATUS_LEN];
+    char bundle_dir[PATH_MAX];
+    char tools_dir[PATH_MAX];
     char kilo_cmd[PATH_MAX];
     Panel panels[2];
 } App;
@@ -129,6 +131,8 @@ static bool join_path (char *dst, size_t dst_size, const char *dir, const char *
 static bool parent_path (char *dst, size_t dst_size, const char *path);
 static bool resolve_existing_path (char *dst, size_t dst_size, const char *path);
 static bool resolve_executable_dir (const char *argv0, char *dst, size_t dst_size);
+static bool resolve_optional_tool (const char *name, char *dst, size_t dst_size);
+static bool validate_terminal_environment (void);
 static void panel_move_selection (Panel *panel, int delta);
 static void refresh_panels (void);
 
@@ -596,7 +600,10 @@ run_child_process (const char *cwd, char *const argv[], int stdout_fd)
                 _exit (125);
             close (stdout_fd);
         }
-        execvp (argv[0], argv);
+        if (strchr (argv[0], '/') != NULL)
+            execv (argv[0], argv);
+        else
+            execvp (argv[0], argv);
         fprintf (stderr, "Unable to exec %s: %s\n", argv[0], strerror (errno));
         _exit (127);
     }
@@ -638,12 +645,9 @@ run_filter_to_file (const char *output_path, char *const argv[])
 }
 
 static bool
-compute_sibling_path (const char *argv0, const char *binary_name, char *dst, size_t dst_size)
+compute_bundle_path (const char *name, char *dst, size_t dst_size)
 {
-    char exec_dir[PATH_MAX];
-
-    return resolve_executable_dir (argv0, exec_dir, sizeof (exec_dir))
-           && join_path (dst, dst_size, exec_dir, binary_name);
+    return g_app.bundle_dir[0] != '\0' && join_path (dst, dst_size, g_app.bundle_dir, name);
 }
 
 static bool
@@ -726,11 +730,32 @@ resolve_executable_dir (const char *argv0, char *dst, size_t dst_size)
 }
 
 static bool
-discover_default_kilo (const char *argv0, char *dst, size_t dst_size)
+resolve_optional_tool (const char *name, char *dst, size_t dst_size)
+{
+    char bundled[PATH_MAX];
+
+    if (g_app.tools_dir[0] != '\0' && join_path (bundled, sizeof (bundled), g_app.tools_dir, name)
+        && access (bundled, X_OK) == 0 && copy_string (dst, dst_size, bundled))
+        return true;
+
+    return find_executable_in_path (name, dst, dst_size);
+}
+
+static void
+set_missing_optional_tool_status (const char *feature, const char *tool_name)
+{
+    if (g_app.tools_dir[0] != '\0')
+        set_status ("%s unavailable: need %s in %s or PATH", feature, tool_name, g_app.tools_dir);
+    else
+        set_status ("%s unavailable: need %s in bundle tools/ or PATH", feature, tool_name);
+}
+
+static bool
+discover_default_kilo (char *dst, size_t dst_size)
 {
     char sibling[PATH_MAX];
 
-    if (compute_sibling_path (argv0, ZC_BUNDLED_KILO_NAME, sibling, sizeof (sibling)))
+    if (compute_bundle_path (ZC_BUNDLED_KILO_NAME, sibling, sizeof (sibling)))
     {
         if (ZC_FORCE_BUNDLED_EDITOR)
             return copy_string (dst, dst_size, sibling);
@@ -741,6 +766,27 @@ discover_default_kilo (const char *argv0, char *dst, size_t dst_size)
     if (ZC_FORCE_BUNDLED_EDITOR)
         return copy_string (dst, dst_size, ZC_BUNDLED_KILO_NAME);
     return copy_string (dst, dst_size, "kilo");
+}
+
+static bool
+validate_terminal_environment (void)
+{
+    const char *term;
+
+    if (!isatty (STDIN_FILENO) || !isatty (STDOUT_FILENO))
+    {
+        fprintf (stderr, "zc needs an interactive terminal on stdin/stdout.\n");
+        return false;
+    }
+
+    term = getenv ("TERM");
+    if (term != NULL && strcmp (term, "dumb") == 0)
+    {
+        fprintf (stderr, "zc needs ANSI-capable terminal features; TERM=dumb is unsupported.\n");
+        return false;
+    }
+
+    return true;
 }
 
 static bool
@@ -1548,9 +1594,23 @@ spawn_kilo (const char *path, bool readonly)
     if (pid == 0)
     {
         if (readonly)
-            execlp (g_app.kilo_cmd, g_app.kilo_cmd, "--readonly", path, (char *) NULL);
+        {
+            char *argv[] = { g_app.kilo_cmd, "--readonly", (char *) path, NULL };
+
+            if (strchr (g_app.kilo_cmd, '/') != NULL)
+                execv (g_app.kilo_cmd, argv);
+            else
+                execvp (g_app.kilo_cmd, argv);
+        }
         else
-            execlp (g_app.kilo_cmd, g_app.kilo_cmd, path, (char *) NULL);
+        {
+            char *argv[] = { g_app.kilo_cmd, (char *) path, NULL };
+
+            if (strchr (g_app.kilo_cmd, '/') != NULL)
+                execv (g_app.kilo_cmd, argv);
+            else
+                execvp (g_app.kilo_cmd, argv);
+        }
         fprintf (stderr, "Unable to exec %s: %s\n", g_app.kilo_cmd, strerror (errno));
         _exit (127);
     }
@@ -1583,15 +1643,23 @@ pack_with_zip (Panel *panel, const size_t *indexes, size_t count, const char *ds
 {
     char **argv;
     char **owned_names;
+    char zip_cmd[PATH_MAX];
     size_t i;
     int rc;
+
+    if (!resolve_optional_tool ("zip", zip_cmd, sizeof (zip_cmd)))
+    {
+        set_missing_optional_tool_status ("Pack", "zip");
+        errno = 0;
+        return false;
+    }
 
     argv = calloc (count + 4, sizeof (*argv));
     owned_names = calloc (count, sizeof (*owned_names));
     if (argv == NULL || owned_names == NULL)
         die ("calloc");
 
-    argv[0] = "zip";
+    argv[0] = zip_cmd;
     argv[1] = "-r";
     argv[2] = (char *) dst_path;
     for (i = 0; i < count; i++)
@@ -1634,15 +1702,23 @@ pack_with_bsdtar (Panel *panel, const size_t *indexes, size_t count, const char 
 {
     char **argv;
     char **owned_names;
+    char tar_cmd[PATH_MAX];
     size_t i;
     int rc;
+
+    if (!resolve_optional_tool ("bsdtar", tar_cmd, sizeof (tar_cmd)))
+    {
+        set_missing_optional_tool_status ("Pack", "bsdtar");
+        errno = 0;
+        return false;
+    }
 
     argv = calloc (count + 6, sizeof (*argv));
     owned_names = calloc (count, sizeof (*owned_names));
     if (argv == NULL || owned_names == NULL)
         die ("calloc");
 
-    argv[0] = "bsdtar";
+    argv[0] = tar_cmd;
     argv[1] = auto_compress ? "-caf" : "-cf";
     argv[2] = (char *) dst_path;
     argv[3] = "--";
@@ -1684,30 +1760,32 @@ static bool
 pack_single_file_stream (const char *src_path, const char *dst_path, ArchiveKind kind)
 {
     char *argv[6];
+    char tool_path[PATH_MAX];
+    const char *tool_name;
 
     memset (argv, 0, sizeof (argv));
     switch (kind)
     {
     case ARCHIVE_KIND_GZ:
-        argv[0] = "gzip";
+        tool_name = "gzip";
         argv[1] = "-c";
         argv[2] = "--";
         argv[3] = (char *) src_path;
         break;
     case ARCHIVE_KIND_BZ2:
-        argv[0] = "bzip2";
+        tool_name = "bzip2";
         argv[1] = "-c";
         argv[2] = "--";
         argv[3] = (char *) src_path;
         break;
     case ARCHIVE_KIND_XZ:
-        argv[0] = "xz";
+        tool_name = "xz";
         argv[1] = "-c";
         argv[2] = "--";
         argv[3] = (char *) src_path;
         break;
     case ARCHIVE_KIND_ZST:
-        argv[0] = "zstd";
+        tool_name = "zstd";
         argv[1] = "-q";
         argv[2] = "-c";
         argv[3] = "--";
@@ -1718,6 +1796,14 @@ pack_single_file_stream (const char *src_path, const char *dst_path, ArchiveKind
         return false;
     }
 
+    if (!resolve_optional_tool (tool_name, tool_path, sizeof (tool_path)))
+    {
+        set_missing_optional_tool_status ("Pack", tool_name);
+        errno = 0;
+        return false;
+    }
+
+    argv[0] = tool_path;
     return run_filter_to_file (dst_path, argv);
 }
 
@@ -1801,7 +1887,8 @@ pack_selection_in_active_panel (void)
         if (!pack_single_file_stream (src_path, dst_path, kind))
         {
             free (indexes);
-            set_status ("Cannot pack to %s: %s", dst_path, strerror (errno));
+            if (errno != 0)
+                set_status ("Cannot pack to %s: %s", dst_path, strerror (errno));
             return;
         }
     }
@@ -1810,7 +1897,8 @@ pack_selection_in_active_panel (void)
         if (!pack_with_zip (panel, indexes, count, dst_path))
         {
             free (indexes);
-            set_status ("Cannot pack to %s: %s", dst_path, strerror (errno));
+            if (errno != 0)
+                set_status ("Cannot pack to %s: %s", dst_path, strerror (errno));
             return;
         }
     }
@@ -1819,7 +1907,8 @@ pack_selection_in_active_panel (void)
         if (!pack_with_bsdtar (panel, indexes, count, dst_path, kind != ARCHIVE_KIND_TAR))
         {
             free (indexes);
-            set_status ("Cannot pack to %s: %s", dst_path, strerror (errno));
+            if (errno != 0)
+                set_status ("Cannot pack to %s: %s", dst_path, strerror (errno));
             return;
         }
     }
@@ -1833,30 +1922,32 @@ static bool
 unpack_single_file_stream (const char *src_path, const char *dst_path, ArchiveKind kind)
 {
     char *argv[7];
+    char tool_path[PATH_MAX];
+    const char *tool_name;
 
     memset (argv, 0, sizeof (argv));
     switch (kind)
     {
     case ARCHIVE_KIND_GZ:
-        argv[0] = "gzip";
+        tool_name = "gzip";
         argv[1] = "-cd";
         argv[2] = "--";
         argv[3] = (char *) src_path;
         break;
     case ARCHIVE_KIND_BZ2:
-        argv[0] = "bzip2";
+        tool_name = "bzip2";
         argv[1] = "-cd";
         argv[2] = "--";
         argv[3] = (char *) src_path;
         break;
     case ARCHIVE_KIND_XZ:
-        argv[0] = "xz";
+        tool_name = "xz";
         argv[1] = "-cd";
         argv[2] = "--";
         argv[3] = (char *) src_path;
         break;
     case ARCHIVE_KIND_ZST:
-        argv[0] = "zstd";
+        tool_name = "zstd";
         argv[1] = "-q";
         argv[2] = "-d";
         argv[3] = "-c";
@@ -1868,6 +1959,14 @@ unpack_single_file_stream (const char *src_path, const char *dst_path, ArchiveKi
         return false;
     }
 
+    if (!resolve_optional_tool (tool_name, tool_path, sizeof (tool_path)))
+    {
+        set_missing_optional_tool_status ("Unpack", tool_name);
+        errno = 0;
+        return false;
+    }
+
+    argv[0] = tool_path;
     return run_filter_to_file (dst_path, argv);
 }
 
@@ -1951,15 +2050,25 @@ unpack_archive_in_active_panel (void)
         if (!unpack_single_file_stream (src_path, out_path, kind))
         {
             free (indexes);
-            set_status ("Cannot unpack %s: %s", entry->name, strerror (errno));
+            if (errno != 0)
+                set_status ("Cannot unpack %s: %s", entry->name, strerror (errno));
             return;
         }
     }
     else
     {
-        char *argv[] = { "bsdtar", "-xf", src_path, "-C", dst_dir, NULL };
-        int rc = run_child_process (NULL, argv, -1);
+        char tar_cmd[PATH_MAX];
+        char *argv[] = { tar_cmd, "-xf", src_path, "-C", dst_dir, NULL };
+        int rc;
 
+        if (!resolve_optional_tool ("bsdtar", tar_cmd, sizeof (tar_cmd)))
+        {
+            free (indexes);
+            set_missing_optional_tool_status ("Unpack", "bsdtar");
+            return;
+        }
+
+        rc = run_child_process (NULL, argv, -1);
         if (rc != 0)
         {
             free (indexes);
@@ -2501,7 +2610,7 @@ static void
 print_help (const char *argv0)
 {
     printf ("Usage: %s [path] [--left PATH --right PATH]\n", argv0);
-    printf ("zero-commander (zc): minimal two-panel file manager using external kilo.\n");
+    printf ("zero-commander (zc): USB-first portable two-panel file commander.\n");
 }
 
 static bool
@@ -2557,11 +2666,15 @@ init_app (const char *argv0)
 
     memset (&g_app, 0, sizeof (g_app));
     g_app.running = true;
+    if (!resolve_executable_dir (argv0, g_app.bundle_dir, sizeof (g_app.bundle_dir)))
+        copy_string (g_app.bundle_dir, sizeof (g_app.bundle_dir), ".");
+    if (!join_path (g_app.tools_dir, sizeof (g_app.tools_dir), g_app.bundle_dir, "tools"))
+        g_app.tools_dir[0] = '\0';
 
     if (!ZC_FORCE_BUNDLED_EDITOR && kilo_env != NULL && kilo_env[0] != '\0')
         copy_string (g_app.kilo_cmd, sizeof (g_app.kilo_cmd), kilo_env);
     else
-        discover_default_kilo (argv0, g_app.kilo_cmd, sizeof (g_app.kilo_cmd));
+        discover_default_kilo (g_app.kilo_cmd, sizeof (g_app.kilo_cmd));
     if (ZC_FORCE_BUNDLED_EDITOR)
         set_status ("Ready. bundled editor: %s", g_app.kilo_cmd);
     else
@@ -2582,6 +2695,9 @@ main (int argc, char **argv)
     }
 
     if (!panel_load_path (&g_app.panels[0], left_path) || !panel_load_path (&g_app.panels[1], right_path))
+        return EXIT_FAILURE;
+
+    if (!validate_terminal_environment ())
         return EXIT_FAILURE;
 
     enable_raw_mode ();

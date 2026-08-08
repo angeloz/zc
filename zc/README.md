@@ -1,107 +1,105 @@
 # zero-commander (`zc`)
 
-`zc`, short for zero-commander, is a small two-panel file manager built from scratch with a `kilo`-style bias toward low complexity.
-
-## Goals
-
-- Keep the codebase small and dependency-light.
-- Work as a local filesystem commander.
-- Build and ship a bundled `kilo` from source for editing and read-only viewing.
-- Stay friendly to Cosmopolitan-style builds by avoiding heavy libraries.
+`zc`, short for zero-commander, is a USB-first portable two-panel file commander. The intended distribution is a small bundle that can live on a removable drive, launch from that directory, and operate on the host machine's local filesystem without installation.
 
 ## Status
 
-`zc` is currently a usable local two-panel prototype. It is intentionally narrower than `mc`: no subshell, no VFS, no plugins, no remote filesystems, and no internal editor/viewer beyond the bundled `zc-kilo`.
+As of Saturday, August 8, 2026, `zc` is a usable local prototype with the USB-first runtime model documented and partially enforced in code:
 
-## Current behavior
+- core filesystem work is local-host only
+- bundled `zc-kilo` remains the default editor/viewer handoff
+- optional pack/unpack helpers now resolve from the bundle `tools/` directory before `PATH`
 
-- Two local panels.
-- Arrow keys, `Tab`, `Enter`, `Backspace`.
-- `F1` shows a compact help screen.
-- `F2` or `Ctrl-P` packs the current item or the marked selection into an archive.
-- `Space` toggles mark on the current entry and advances the cursor.
-- `*` marks or unmarks all regular entries in the active panel.
-- `Ctrl-N` creates a new empty file in the active panel.
-- `F3` view via bundled `zc-kilo --readonly`.
-- `F4` edit via bundled `zc-kilo`.
-- `F5` copy to the opposite panel.
-- `F6` move to a prompted destination.
-- `F7` create a directory.
-- `F8` delete after confirmation.
-- `F10` or `Ctrl-Q` quits `zc`.
-- `n` rename a single item in place inside the active panel.
-- `Ctrl-U` unpacks the selected archive into a chosen directory.
-- `r` refresh, `q` quit.
+Current implementation status is still narrower than the product direction:
 
-When one or more entries are marked, copy, move, and delete operate on the full marked set. Without marks, they operate on the current entry only.
+- supported today: POSIX-style terminals on macOS/Linux
+- target direction: macOS, Linux, and Windows portable bundles
+- Windows console support and validation are not complete yet
 
-`zc` prefers a sibling bundled editor built from the vendored upstream `antirez/kilo` source in `third_party/kilo/`.
+## Runtime Contract
 
-- native/local build: sibling `zc-kilo`
-- Cosmopolitan build: sibling `zc-kilo.com`
+- `zc` always acts on the host filesystem.
+- `zc` does not create a private environment or sandbox.
+- `zc` uses the host terminal and the host machine's filesystem permissions.
+- Core file work must function when the whole bundle is moved to another directory.
+- Core behavior does not depend on host `PATH`.
+- Optional archive helpers degrade with explicit status messages when unavailable.
 
-For the native build you can still override the editor with `ZC_KILO=/path/to/editor`. In Cosmopolitan mode the runtime expects the sibling bundled editor and does not fall back to `PATH`.
+## Core Features
 
-## License
+- Two local panels
+- Arrow keys, `Tab`, `Enter`, `Backspace`
+- `F1` help
+- `F3` view via bundled `zc-kilo --readonly`
+- `F4` edit via bundled `zc-kilo`
+- `F5` copy
+- `F6` move
+- `F7` create directory
+- `F8` delete after confirmation
+- `Ctrl-N` create empty file
+- `n` rename a single item
+- `Space` toggle mark and advance
+- `*` mark or unmark all regular entries
+- `F10` or `Ctrl-Q` quit
 
-`zc` uses the same BSD 2-Clause license family as `kilo`.
+Optional archive actions remain command-oriented only:
 
-- Project license: [LICENSE](/Users/azaia/Git/mc/zc/LICENSE)
-- Vendored editor license: [third_party/kilo/LICENSE](/Users/azaia/Git/mc/zc/third_party/kilo/LICENSE)
+- `F2` / `Ctrl-P` pack the current item or marked set
+- `Ctrl-U` unpack a selected archive into a chosen directory
+- archive browsing is out of scope
 
-## Keymap
+## Stable Bundle Layout
 
-- `F1`: help
-- `F2` / `Ctrl-P`: pack selected item or marked set into an archive
-- `F3`: view selected file with `zc-kilo --readonly`
-- `F4`: edit selected file with `zc-kilo`
-- `F5`: copy selected item or marked set
-- `F6`: move selected item or marked set
-- `F7`: create directory
-- `F8`: delete selected item or marked set
-- `F10`: quit
-- `Ctrl-N`: create empty file
-- `Ctrl-Q`: quit
-- `Tab`: switch active panel
-- `Space`: mark/unmark current entry
-- `*`: mark/unmark all entries in active panel
-- `n`: rename a single item
-- `Ctrl-U`: unpack selected archive into a directory
-- `r`: refresh
+```text
+zc-bundle/
+  zc
+  zc-kilo
+  tools/
+```
 
-## What Is Not Implemented
+Cosmopolitan layout:
 
-- `mc`-style top menu or user menu on `F9`
-- remote or archive browsing/filesystems
-- background jobs
-- integrated file creation via editor templates
-- a native internal editor or viewer distinct from `zc-kilo`
+```text
+zc-cosmo-bundle/
+  zc.com
+  zc-kilo.com
+  tools/
+```
+
+Rules:
+
+- `zc` and `zc-kilo` are sibling executables in the bundle root.
+- Optional helper executables such as `bsdtar`, `zip`, `gzip`, `bzip2`, `xz`, or `zstd` belong in `tools/`.
+- `zc` checks `tools/` before host `PATH` for optional helper resolution.
+- Native builds may still use `ZC_KILO=/path/to/editor` to override the bundled editor.
+- Cosmopolitan builds keep deterministic sibling lookup and do not fall back to `PATH` for the editor.
 
 ## Build
 
 ```sh
 cd zc
 make
+make bundle
 ```
 
-This builds:
+This produces:
 
-- `./zc`
-- `./zc-kilo`
+- local binaries: `./zc`, `./zc-kilo`
+- portable bundle layout: `./dist/zc-bundle/`
 
-To try a Cosmopolitan build:
+Cosmopolitan-oriented build:
 
 ```sh
 cd zc
 make cosmo COSMOCC=cosmocc
+make bundle-cosmo COSMOCC=cosmocc
 ```
 
-This is intended to build:
+This is intended to produce:
 
 - `./zc.com`
 - `./zc-kilo.com`
-
-The Cosmopolitan distribution is a two-file bundle. `zc.com` expects `zc-kilo.com` in the same directory.
+- `./dist/zc-cosmo-bundle/`
 
 ## Run
 
@@ -111,13 +109,30 @@ The Cosmopolitan distribution is a two-file bundle. `zc.com` expects `zc-kilo.co
 ./zc --left /tmp --right "$HOME"
 ```
 
-Set `ZC_KILO` if you want to override the bundled editor in the native build:
+Portable-bundle usage is expected to look like:
 
 ```sh
-ZC_KILO=/path/to/kilo ./zc
+cd /Volumes/MyUSB/zc-bundle
+./zc
 ```
+
+## What Is Not Implemented
+
+- archive browsing or archive-as-directory navigation
+- subshells or remote filesystems
+- background jobs
+- plugin-style extension mechanisms
+- a separate internal editor/viewer distinct from `zc-kilo`
+- validated Windows console support
+
+## License
+
+`zc` uses the same BSD 2-Clause license family as `kilo`.
+
+- Project license: [LICENSE](/Users/azaia/Git/mc/zc/LICENSE)
+- Vendored editor license: [third_party/kilo/LICENSE](/Users/azaia/Git/mc/zc/third_party/kilo/LICENSE)
 
 ## More Docs
 
-- See [DOCUMENTATION.md](/Users/azaia/Git/mc/zc/DOCUMENTATION.md) for architecture, current limits, and behavior notes.
-- See [AGENTS.md](/Users/azaia/Git/mc/zc/AGENTS.md) for maintenance conventions inside `zc/`.
+- [DOCUMENTATION.md](/Users/azaia/Git/mc/zc/DOCUMENTATION.md) covers the runtime contract, bundle layout, host expectations, and validation matrix.
+- [AGENTS.md](/Users/azaia/Git/mc/zc/AGENTS.md) covers maintenance conventions inside `zc/`.
