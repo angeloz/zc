@@ -42,13 +42,14 @@ This file describes how to work on `zc/` safely and consistently.
 - File-manager actions should prefer `mc`-style function keys where there is a clear equivalent.
 - Text-oriented convenience shortcuts may follow `kilo` conventions when they do not conflict badly.
 - Keep help text, README, and runtime footer consistent with the implemented keymap.
+- Keep archive support command-oriented: pack/unpack actions are fine, archive browsing is out of scope.
 
 ## Current scope limits
 
 - No subshell.
 - No remote VFS.
 - No archive browsing.
-- No menu bar or user menu on `F2` / `F9`.
+- No menu bar or user menu on `F9`.
 - No separate internal editor/viewer beyond launching `zc-kilo`.
 
 ## Cosmopolitan bundle policy

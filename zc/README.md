@@ -18,6 +18,7 @@
 - Two local panels.
 - Arrow keys, `Tab`, `Enter`, `Backspace`.
 - `F1` shows a compact help screen.
+- `F2` or `Ctrl-P` packs the current item or the marked selection into an archive.
 - `Space` toggles mark on the current entry and advances the cursor.
 - `*` marks or unmarks all regular entries in the active panel.
 - `Ctrl-N` creates a new empty file in the active panel.
@@ -29,6 +30,7 @@
 - `F8` delete after confirmation.
 - `F10` or `Ctrl-Q` quits `zc`.
 - `n` rename a single item in place inside the active panel.
+- `Ctrl-U` unpacks the selected archive into a chosen directory.
 - `r` refresh, `q` quit.
 
 When one or more entries are marked, copy, move, and delete operate on the full marked set. Without marks, they operate on the current entry only.
@@ -50,6 +52,7 @@ For the native build you can still override the editor with `ZC_KILO=/path/to/ed
 ## Keymap
 
 - `F1`: help
+- `F2` / `Ctrl-P`: pack selected item or marked set into an archive
 - `F3`: view selected file with `zc-kilo --readonly`
 - `F4`: edit selected file with `zc-kilo`
 - `F5`: copy selected item or marked set
@@ -63,12 +66,13 @@ For the native build you can still override the editor with `ZC_KILO=/path/to/ed
 - `Space`: mark/unmark current entry
 - `*`: mark/unmark all entries in active panel
 - `n`: rename a single item
+- `Ctrl-U`: unpack selected archive into a directory
 - `r`: refresh
 
 ## What Is Not Implemented
 
-- `mc`-style top menu or user menu on `F2` / `F9`
-- remote or archive filesystems
+- `mc`-style top menu or user menu on `F9`
+- remote or archive browsing/filesystems
 - background jobs
 - integrated file creation via editor templates
 - a native internal editor or viewer distinct from `zc-kilo`

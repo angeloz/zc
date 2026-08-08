@@ -62,6 +62,7 @@ This matters for future development: copying GPL-only implementation code from `
 ### File-manager oriented bindings
 
 - `F1`: help
+- `F2` / `Ctrl-P`: pack current item or marked set into an archive
 - `F3`: view
 - `F4`: edit
 - `F5`: copy
@@ -78,9 +79,19 @@ This matters for future development: copying GPL-only implementation code from `
 - `Space`: toggle mark on current entry
 - `*`: toggle mark-all in active panel
 - `n`: rename one item
+- `Ctrl-U`: unpack one archive into a chosen directory
 - `r`: refresh
 - `Enter`: open directory or file
 - `Backspace` / `-`: go to parent directory
+
+### Compression note
+
+Archive handling stays deliberately narrow:
+
+- no archive browsing
+- no archive-as-directory view
+- explicit pack/unpack commands only
+- compression uses external tools already present on the system
 
 ### Compatibility note
 
@@ -106,7 +117,6 @@ Current bulk-aware actions:
 ## Current limitations
 
 - no `mc`-style menu bar or user menu
-- no `F2` action beyond reserved future compatibility
 - no `F9` menu implementation
 - no remote filesystems
 - no archive browsing
@@ -144,7 +154,7 @@ The expected deployment model is a two-file bundle in one directory, with `zc.co
 
 ## Suggested next steps
 
-- decide what `F2` should become, if anything
+- validate pack/unpack behavior across the supported archive extensions
 - decide whether `F9` should remain unimplemented or gain a minimal menu
 - validate the two-file Cosmopolitan bundle on actual target systems once `cosmocc` is available
 - consider a clearer status line for marked-count and current operation results

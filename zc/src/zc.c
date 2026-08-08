@@ -108,12 +108,29 @@ typedef struct
     Panel panels[2];
 } App;
 
+typedef enum
+{
+    ARCHIVE_KIND_NONE = 0,
+    ARCHIVE_KIND_ZIP,
+    ARCHIVE_KIND_TAR,
+    ARCHIVE_KIND_TAR_GZ,
+    ARCHIVE_KIND_TAR_BZ2,
+    ARCHIVE_KIND_TAR_XZ,
+    ARCHIVE_KIND_TAR_ZST,
+    ARCHIVE_KIND_GZ,
+    ARCHIVE_KIND_BZ2,
+    ARCHIVE_KIND_XZ,
+    ARCHIVE_KIND_ZST
+} ArchiveKind;
+
 static App g_app;
 
 static bool join_path (char *dst, size_t dst_size, const char *dir, const char *name);
+static bool parent_path (char *dst, size_t dst_size, const char *path);
 static bool resolve_existing_path (char *dst, size_t dst_size, const char *path);
 static bool resolve_executable_dir (const char *argv0, char *dst, size_t dst_size);
 static void panel_move_selection (Panel *panel, int delta);
+static void refresh_panels (void);
 
 static void
 die (const char *message)
@@ -443,6 +460,181 @@ copy_string (char *dst, size_t dst_size, const char *src)
 
     rc = snprintf (dst, dst_size, "%s", src);
     return rc >= 0 && (size_t) rc < dst_size;
+}
+
+static bool
+has_suffix (const char *value, const char *suffix)
+{
+    size_t value_len;
+    size_t suffix_len;
+
+    value_len = strlen (value);
+    suffix_len = strlen (suffix);
+    if (suffix_len > value_len)
+        return false;
+    return strcmp (value + value_len - suffix_len, suffix) == 0;
+}
+
+static ArchiveKind
+detect_archive_kind (const char *path)
+{
+    if (has_suffix (path, ".tar.gz") || has_suffix (path, ".tgz"))
+        return ARCHIVE_KIND_TAR_GZ;
+    if (has_suffix (path, ".tar.bz2"))
+        return ARCHIVE_KIND_TAR_BZ2;
+    if (has_suffix (path, ".tar.xz"))
+        return ARCHIVE_KIND_TAR_XZ;
+    if (has_suffix (path, ".tar.zst"))
+        return ARCHIVE_KIND_TAR_ZST;
+    if (has_suffix (path, ".tar"))
+        return ARCHIVE_KIND_TAR;
+    if (has_suffix (path, ".zip"))
+        return ARCHIVE_KIND_ZIP;
+    if (has_suffix (path, ".gz"))
+        return ARCHIVE_KIND_GZ;
+    if (has_suffix (path, ".bz2"))
+        return ARCHIVE_KIND_BZ2;
+    if (has_suffix (path, ".xz"))
+        return ARCHIVE_KIND_XZ;
+    if (has_suffix (path, ".zst"))
+        return ARCHIVE_KIND_ZST;
+    return ARCHIVE_KIND_NONE;
+}
+
+static bool
+archive_kind_is_single_file (ArchiveKind kind)
+{
+    return kind == ARCHIVE_KIND_GZ || kind == ARCHIVE_KIND_BZ2 || kind == ARCHIVE_KIND_XZ
+           || kind == ARCHIVE_KIND_ZST;
+}
+
+static bool
+archive_member_name (char *dst, size_t dst_size, const char *name)
+{
+    int rc;
+
+    rc = snprintf (dst, dst_size, "./%s", name);
+    return rc >= 0 && (size_t) rc < dst_size;
+}
+
+static bool
+strip_archive_suffix (char *dst, size_t dst_size, const char *name)
+{
+    static const char *suffixes[] = { ".tar.gz", ".tgz", ".tar.bz2", ".tar.xz", ".tar.zst",
+                                      ".tar",    ".zip", ".gz",      ".bz2",    ".xz",
+                                      ".zst" };
+    size_t i;
+    size_t name_len;
+
+    if (!copy_string (dst, dst_size, name))
+        return false;
+
+    name_len = strlen (dst);
+    for (i = 0; i < sizeof (suffixes) / sizeof (suffixes[0]); i++)
+    {
+        size_t suffix_len = strlen (suffixes[i]);
+        if (name_len > suffix_len && strcmp (dst + name_len - suffix_len, suffixes[i]) == 0)
+        {
+            dst[name_len - suffix_len] = '\0';
+            return true;
+        }
+    }
+
+    return true;
+}
+
+static bool
+ensure_directory_exists (const char *path)
+{
+    struct stat st;
+    char parent[PATH_MAX];
+
+    if (stat (path, &st) == 0)
+        return S_ISDIR (st.st_mode);
+    if (errno != ENOENT)
+        return false;
+
+    if (!parent_path (parent, sizeof (parent), path))
+    {
+        errno = ENAMETOOLONG;
+        return false;
+    }
+
+    if (strcmp (parent, path) != 0 && !ensure_directory_exists (parent))
+        return false;
+
+    if (mkdir (path, 0755) == -1 && errno != EEXIST)
+        return false;
+
+    return stat (path, &st) == 0 && S_ISDIR (st.st_mode);
+}
+
+static int
+run_child_process (const char *cwd, char *const argv[], int stdout_fd)
+{
+    pid_t pid;
+    int status = 0;
+
+    disable_raw_mode ();
+    clear_screen ();
+    fflush (stdout);
+
+    pid = fork ();
+    if (pid == -1)
+    {
+        enable_raw_mode ();
+        return -1;
+    }
+
+    if (pid == 0)
+    {
+        if (cwd != NULL && chdir (cwd) == -1)
+            _exit (125);
+        if (stdout_fd != -1)
+        {
+            if (dup2 (stdout_fd, STDOUT_FILENO) == -1)
+                _exit (125);
+            close (stdout_fd);
+        }
+        execvp (argv[0], argv);
+        fprintf (stderr, "Unable to exec %s: %s\n", argv[0], strerror (errno));
+        _exit (127);
+    }
+
+    if (stdout_fd != -1)
+        close (stdout_fd);
+
+    while (waitpid (pid, &status, 0) == -1)
+    {
+        if (errno != EINTR)
+            break;
+    }
+
+    enable_raw_mode ();
+    if (WIFEXITED (status))
+        return WEXITSTATUS (status);
+    return -1;
+}
+
+static bool
+run_filter_to_file (const char *output_path, char *const argv[])
+{
+    int out_fd;
+    int rc;
+
+    out_fd = open (output_path, O_WRONLY | O_CREAT | O_EXCL | O_TRUNC, 0644);
+    if (out_fd == -1)
+        return false;
+
+    rc = run_child_process (NULL, argv, out_fd);
+    if (rc != 0)
+    {
+        unlink (output_path);
+        errno = rc == 127 ? ENOENT : EIO;
+        return false;
+    }
+
+    return true;
 }
 
 static bool
@@ -1045,8 +1237,8 @@ draw_screen (const char *prompt_label, const char *prompt_value)
     else
     {
         snprintf (bottom_line, sizeof (bottom_line),
-                  "[F1] Help  [Ctrl-N] NewFile  [Space] Mark  [Tab] Switch  [F3/F4] View/Edit  "
-                  "[F5/F6] Copy/Move  [F7] Mkdir  [F8] Delete  [F10/Ctrl-Q] Quit");
+                  "[F1] Help  [F2/Ctrl-P] Pack  [Ctrl-U] Unpack  [Ctrl-N] NewFile  [Space] Mark  [Tab] Switch  "
+                  "[F3/F4] View/Edit  [F5/F6] Copy/Move  [F7] Mkdir  [F8] Delete  [F10/Ctrl-Q] Quit");
         ab_appendf (&ab, "%.*s", g_app.screen_cols, bottom_line);
     }
 
@@ -1138,6 +1330,7 @@ show_help_screen (void)
     row++;
     ab_appendf (&ab, "\x1b[%d;1HF1         Help", row++);
     ab_appendf (&ab, "\x1b[%d;1HEnter      Open file or enter directory", row++);
+    ab_appendf (&ab, "\x1b[%d;1HF2/Ctrl-P  Pack current item or selection", row++);
     ab_appendf (&ab, "\x1b[%d;1HF3         View with zc-kilo --readonly", row++);
     ab_appendf (&ab, "\x1b[%d;1HF4         Edit with zc-kilo", row++);
     ab_appendf (&ab, "\x1b[%d;1HF5         Copy", row++);
@@ -1147,6 +1340,7 @@ show_help_screen (void)
     ab_appendf (&ab, "\x1b[%d;1HF10        Quit", row++);
     ab_appendf (&ab, "\x1b[%d;1HCtrl-N     Create empty file", row++);
     ab_appendf (&ab, "\x1b[%d;1HCtrl-Q     Quit", row++);
+    ab_appendf (&ab, "\x1b[%d;1HCtrl-U     Unpack selected archive", row++);
     ab_appendf (&ab, "\x1b[%d;1HSpace      Mark/unmark current entry", row++);
     ab_appendf (&ab, "\x1b[%d;1H*          Mark/unmark all entries", row++);
     ab_appendf (&ab, "\x1b[%d;1HTab        Switch panel", row++);
@@ -1382,6 +1576,402 @@ selected_full_path (Panel *panel, char *dst, size_t dst_size)
     Entry *entry = panel_selected_entry (panel);
 
     return entry_full_path (panel, entry, dst, dst_size);
+}
+
+static bool
+pack_with_zip (Panel *panel, const size_t *indexes, size_t count, const char *dst_path)
+{
+    char **argv;
+    char **owned_names;
+    size_t i;
+    int rc;
+
+    argv = calloc (count + 4, sizeof (*argv));
+    owned_names = calloc (count, sizeof (*owned_names));
+    if (argv == NULL || owned_names == NULL)
+        die ("calloc");
+
+    argv[0] = "zip";
+    argv[1] = "-r";
+    argv[2] = (char *) dst_path;
+    for (i = 0; i < count; i++)
+    {
+        char member[PATH_MAX];
+
+        if (!archive_member_name (member, sizeof (member), panel->entries[indexes[i]].name))
+        {
+            free (argv);
+            free (owned_names);
+            errno = ENAMETOOLONG;
+            return false;
+        }
+
+        owned_names[i] = strdup (member);
+        if (owned_names[i] == NULL)
+            die ("strdup");
+        argv[3 + i] = owned_names[i];
+    }
+    argv[3 + count] = NULL;
+
+    rc = run_child_process (panel->cwd, argv, -1);
+    for (i = 0; i < count; i++)
+        free (owned_names[i]);
+    free (owned_names);
+    free (argv);
+
+    if (rc != 0)
+    {
+        errno = rc == 127 ? ENOENT : EIO;
+        return false;
+    }
+
+    return true;
+}
+
+static bool
+pack_with_bsdtar (Panel *panel, const size_t *indexes, size_t count, const char *dst_path,
+                  bool auto_compress)
+{
+    char **argv;
+    char **owned_names;
+    size_t i;
+    int rc;
+
+    argv = calloc (count + 6, sizeof (*argv));
+    owned_names = calloc (count, sizeof (*owned_names));
+    if (argv == NULL || owned_names == NULL)
+        die ("calloc");
+
+    argv[0] = "bsdtar";
+    argv[1] = auto_compress ? "-caf" : "-cf";
+    argv[2] = (char *) dst_path;
+    argv[3] = "--";
+    for (i = 0; i < count; i++)
+    {
+        char member[PATH_MAX];
+
+        if (!archive_member_name (member, sizeof (member), panel->entries[indexes[i]].name))
+        {
+            free (argv);
+            free (owned_names);
+            errno = ENAMETOOLONG;
+            return false;
+        }
+
+        owned_names[i] = strdup (member);
+        if (owned_names[i] == NULL)
+            die ("strdup");
+        argv[4 + i] = owned_names[i];
+    }
+    argv[4 + count] = NULL;
+
+    rc = run_child_process (panel->cwd, argv, -1);
+    for (i = 0; i < count; i++)
+        free (owned_names[i]);
+    free (owned_names);
+    free (argv);
+
+    if (rc != 0)
+    {
+        errno = rc == 127 ? ENOENT : EIO;
+        return false;
+    }
+
+    return true;
+}
+
+static bool
+pack_single_file_stream (const char *src_path, const char *dst_path, ArchiveKind kind)
+{
+    char *argv[6];
+
+    memset (argv, 0, sizeof (argv));
+    switch (kind)
+    {
+    case ARCHIVE_KIND_GZ:
+        argv[0] = "gzip";
+        argv[1] = "-c";
+        argv[2] = "--";
+        argv[3] = (char *) src_path;
+        break;
+    case ARCHIVE_KIND_BZ2:
+        argv[0] = "bzip2";
+        argv[1] = "-c";
+        argv[2] = "--";
+        argv[3] = (char *) src_path;
+        break;
+    case ARCHIVE_KIND_XZ:
+        argv[0] = "xz";
+        argv[1] = "-c";
+        argv[2] = "--";
+        argv[3] = (char *) src_path;
+        break;
+    case ARCHIVE_KIND_ZST:
+        argv[0] = "zstd";
+        argv[1] = "-q";
+        argv[2] = "-c";
+        argv[3] = "--";
+        argv[4] = (char *) src_path;
+        break;
+    default:
+        errno = ENOTSUP;
+        return false;
+    }
+
+    return run_filter_to_file (dst_path, argv);
+}
+
+static void
+pack_selection_in_active_panel (void)
+{
+    Panel *panel = &g_app.panels[g_app.active_panel];
+    size_t *indexes = NULL;
+    size_t count;
+    char dst_path[PATH_MAX];
+    char default_dst[PATH_MAX];
+    ArchiveKind kind;
+
+    count = panel_collect_target_indexes (panel, &indexes);
+    if (count == 0)
+    {
+        set_status ("Nothing to pack");
+        return;
+    }
+
+    if (count == 1)
+    {
+        int rc = snprintf (default_dst, sizeof (default_dst), "%s/%s.zip", panel->cwd,
+                           panel->entries[indexes[0]].name);
+        if (rc < 0 || (size_t) rc >= sizeof (default_dst))
+        {
+            free (indexes);
+            set_status ("Path too long");
+            return;
+        }
+    }
+    else if (!join_path (default_dst, sizeof (default_dst), panel->cwd, "archive.zip"))
+    {
+        free (indexes);
+        set_status ("Path too long");
+        return;
+    }
+
+    if (!prompt_input ("Pack to: ", default_dst, dst_path, sizeof (dst_path)))
+    {
+        free (indexes);
+        set_status ("Pack canceled");
+        return;
+    }
+
+    kind = detect_archive_kind (dst_path);
+    if (kind == ARCHIVE_KIND_NONE)
+    {
+        free (indexes);
+        set_status ("Unsupported archive extension");
+        return;
+    }
+
+    if (archive_kind_is_single_file (kind))
+    {
+        char src_path[PATH_MAX];
+        Entry *entry;
+
+        if (count != 1)
+        {
+            free (indexes);
+            set_status ("Single-file compression needs one file");
+            return;
+        }
+
+        entry = &panel->entries[indexes[0]];
+        if (entry->is_dir)
+        {
+            free (indexes);
+            set_status ("Single-file compression does not support directories");
+            return;
+        }
+
+        if (!entry_full_path (panel, entry, src_path, sizeof (src_path)))
+        {
+            free (indexes);
+            set_status ("Path too long");
+            return;
+        }
+
+        if (!pack_single_file_stream (src_path, dst_path, kind))
+        {
+            free (indexes);
+            set_status ("Cannot pack to %s: %s", dst_path, strerror (errno));
+            return;
+        }
+    }
+    else if (kind == ARCHIVE_KIND_ZIP)
+    {
+        if (!pack_with_zip (panel, indexes, count, dst_path))
+        {
+            free (indexes);
+            set_status ("Cannot pack to %s: %s", dst_path, strerror (errno));
+            return;
+        }
+    }
+    else
+    {
+        if (!pack_with_bsdtar (panel, indexes, count, dst_path, kind != ARCHIVE_KIND_TAR))
+        {
+            free (indexes);
+            set_status ("Cannot pack to %s: %s", dst_path, strerror (errno));
+            return;
+        }
+    }
+
+    free (indexes);
+    refresh_panels ();
+    set_status ("Packed to: %s", dst_path);
+}
+
+static bool
+unpack_single_file_stream (const char *src_path, const char *dst_path, ArchiveKind kind)
+{
+    char *argv[7];
+
+    memset (argv, 0, sizeof (argv));
+    switch (kind)
+    {
+    case ARCHIVE_KIND_GZ:
+        argv[0] = "gzip";
+        argv[1] = "-cd";
+        argv[2] = "--";
+        argv[3] = (char *) src_path;
+        break;
+    case ARCHIVE_KIND_BZ2:
+        argv[0] = "bzip2";
+        argv[1] = "-cd";
+        argv[2] = "--";
+        argv[3] = (char *) src_path;
+        break;
+    case ARCHIVE_KIND_XZ:
+        argv[0] = "xz";
+        argv[1] = "-cd";
+        argv[2] = "--";
+        argv[3] = (char *) src_path;
+        break;
+    case ARCHIVE_KIND_ZST:
+        argv[0] = "zstd";
+        argv[1] = "-q";
+        argv[2] = "-d";
+        argv[3] = "-c";
+        argv[4] = "--";
+        argv[5] = (char *) src_path;
+        break;
+    default:
+        errno = ENOTSUP;
+        return false;
+    }
+
+    return run_filter_to_file (dst_path, argv);
+}
+
+static void
+unpack_archive_in_active_panel (void)
+{
+    Panel *panel = &g_app.panels[g_app.active_panel];
+    size_t *indexes = NULL;
+    size_t count;
+    Entry *entry;
+    char src_path[PATH_MAX];
+    char default_dir[PATH_MAX];
+    char dst_dir[PATH_MAX];
+    char unpack_name[PATH_MAX];
+    ArchiveKind kind;
+
+    count = panel_collect_target_indexes (panel, &indexes);
+    if (count != 1)
+    {
+        free (indexes);
+        set_status ("Unpack needs a single archive");
+        return;
+    }
+
+    entry = &panel->entries[indexes[0]];
+    if (entry->is_dir)
+    {
+        free (indexes);
+        set_status ("Unpack works on archive files");
+        return;
+    }
+
+    kind = detect_archive_kind (entry->name);
+    if (kind == ARCHIVE_KIND_NONE)
+    {
+        free (indexes);
+        set_status ("Unsupported archive type");
+        return;
+    }
+
+    if (!strip_archive_suffix (unpack_name, sizeof (unpack_name), entry->name)
+        || !join_path (default_dir, sizeof (default_dir), panel->cwd, unpack_name))
+    {
+        free (indexes);
+        set_status ("Path too long");
+        return;
+    }
+
+    if (!prompt_input ("Unpack to dir: ", default_dir, dst_dir, sizeof (dst_dir)))
+    {
+        free (indexes);
+        set_status ("Unpack canceled");
+        return;
+    }
+
+    if (!entry_full_path (panel, entry, src_path, sizeof (src_path)))
+    {
+        free (indexes);
+        set_status ("Path too long");
+        return;
+    }
+
+    if (!ensure_directory_exists (dst_dir))
+    {
+        free (indexes);
+        set_status ("Cannot create %s: %s", dst_dir, strerror (errno));
+        return;
+    }
+
+    if (archive_kind_is_single_file (kind))
+    {
+        char out_path[PATH_MAX];
+
+        if (!join_path (out_path, sizeof (out_path), dst_dir, unpack_name))
+        {
+            free (indexes);
+            set_status ("Path too long");
+            return;
+        }
+
+        if (!unpack_single_file_stream (src_path, out_path, kind))
+        {
+            free (indexes);
+            set_status ("Cannot unpack %s: %s", entry->name, strerror (errno));
+            return;
+        }
+    }
+    else
+    {
+        char *argv[] = { "bsdtar", "-xf", src_path, "-C", dst_dir, NULL };
+        int rc = run_child_process (NULL, argv, -1);
+
+        if (rc != 0)
+        {
+            free (indexes);
+            set_status ("Cannot unpack %s: %s", entry->name,
+                        rc == 127 ? "tool not found" : "command failed");
+            return;
+        }
+    }
+
+    free (indexes);
+    refresh_panels ();
+    set_status ("Unpacked to: %s", dst_dir);
 }
 
 static bool
@@ -1835,8 +2425,9 @@ handle_key (int key)
     case 'A':
         create_file_in_active_panel ();
         break;
+    case CTRL_KEY ('p'):
     case KEY_F2:
-        set_status ("F2 user menu is not implemented");
+        pack_selection_in_active_panel ();
         break;
     case ' ':
         panel_toggle_selected_mark (panel);
@@ -1870,6 +2461,9 @@ handle_key (int key)
     case 'n':
     case 'N':
         rename_selection_in_place ();
+        break;
+    case CTRL_KEY ('u'):
+        unpack_archive_in_active_panel ();
         break;
     case KEY_F7:
         make_directory_in_active_panel ();
