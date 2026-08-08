@@ -19,7 +19,10 @@
 #include <sys/wait.h>
 #include <termios.h>
 #include <time.h>
+#include <utime.h>
 #include <unistd.h>
+
+#include "monocypher.h"
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -34,12 +37,24 @@
 #endif
 
 #define ZC_VERSION "0.1.0"
+#define ZC_CONTAINER_EXT ".zcc"
+#define ZC_CONTAINER_MAGIC_PLAIN "ZCC1"
+#define ZC_CONTAINER_MAGIC_ENCRYPTED "ZCC2"
 #define STATUS_LEN 256
 #define PROMPT_LEN PATH_MAX
 #define INPUT_CHUNK 32
 #define MIN_SCREEN_ROWS 8
 #define MIN_SCREEN_COLS 40
 #define CTRL_KEY(k) ((k) & 0x1f)
+#define ZC_SALT_LEN 16
+#define ZC_KEY_LEN 32
+#define ZC_NONCE_LEN 24
+#define ZC_TAG_LEN 32
+#define ZC_ARGON2_ALGORITHM CRYPTO_ARGON2_ID
+#define ZC_ARGON2_BLOCKS 32768u
+#define ZC_ARGON2_PASSES 3u
+#define ZC_ARGON2_LANES 1u
+#define ZC_MANIFEST_MAGIC "ZCM1"
 
 enum
 {
@@ -125,13 +140,53 @@ typedef enum
     ARCHIVE_KIND_ZST
 } ArchiveKind;
 
+typedef enum
+{
+    ZC_CONTAINER_RECORD_END = 0,
+    ZC_CONTAINER_RECORD_DIR = 1,
+    ZC_CONTAINER_RECORD_FILE = 2,
+    ZC_CONTAINER_RECORD_SYMLINK = 3
+} ZcContainerRecordType;
+
+typedef enum
+{
+    ZC_CONTAINER_KIND_PLAIN = 0,
+    ZC_CONTAINER_KIND_ENCRYPTED = 1
+} ZcContainerKind;
+
+typedef struct
+{
+    ZcContainerRecordType type;
+    char *src_path;
+    char *relpath;
+    mode_t mode;
+    time_t mtime;
+    uint64_t size;
+} ZcContainerItem;
+
+typedef struct
+{
+    ZcContainerItem *items;
+    size_t len;
+    size_t cap;
+} ZcContainerItemList;
+
+typedef struct
+{
+    unsigned char manifest_enc_key[ZC_KEY_LEN];
+    unsigned char manifest_mac_key[ZC_KEY_LEN];
+    unsigned char payload_master_key[ZC_KEY_LEN];
+} ZcEncryptedKeyset;
+
 static App g_app;
+static char g_container_error[STATUS_LEN];
 
 static bool join_path (char *dst, size_t dst_size, const char *dir, const char *name);
 static bool parent_path (char *dst, size_t dst_size, const char *path);
 static bool resolve_existing_path (char *dst, size_t dst_size, const char *path);
 static bool resolve_executable_dir (const char *argv0, char *dst, size_t dst_size);
 static bool resolve_optional_tool (const char *name, char *dst, size_t dst_size);
+static bool is_zc_container_path (const char *path);
 static bool validate_terminal_environment (void);
 static void panel_move_selection (Panel *panel, int delta);
 static void refresh_panels (void);
@@ -226,6 +281,39 @@ set_status (const char *fmt, ...)
     va_start (ap, fmt);
     vsnprintf (g_app.status, sizeof (g_app.status), fmt, ap);
     va_end (ap);
+}
+
+static void
+set_container_error (const char *fmt, ...)
+{
+    va_list ap;
+
+    va_start (ap, fmt);
+    vsnprintf (g_container_error, sizeof (g_container_error), fmt, ap);
+    va_end (ap);
+}
+
+static void
+clear_container_error (void)
+{
+    g_container_error[0] = '\0';
+}
+
+static const char *
+container_error_or_errno (void)
+{
+    if (g_container_error[0] != '\0')
+        return g_container_error;
+    return strerror (errno);
+}
+
+static void
+secure_zero (void *ptr, size_t len)
+{
+    volatile unsigned char *bytes = ptr;
+
+    while (len-- > 0)
+        *bytes++ = 0;
 }
 
 static int
@@ -479,6 +567,12 @@ has_suffix (const char *value, const char *suffix)
     return strcmp (value + value_len - suffix_len, suffix) == 0;
 }
 
+static bool
+is_zc_container_path (const char *path)
+{
+    return has_suffix (path, ZC_CONTAINER_EXT);
+}
+
 static ArchiveKind
 detect_archive_kind (const char *path)
 {
@@ -510,6 +604,23 @@ archive_kind_is_single_file (ArchiveKind kind)
 {
     return kind == ARCHIVE_KIND_GZ || kind == ARCHIVE_KIND_BZ2 || kind == ARCHIVE_KIND_XZ
            || kind == ARCHIVE_KIND_ZST;
+}
+
+static bool
+strip_zc_container_suffix (char *dst, size_t dst_size, const char *name)
+{
+    size_t name_len;
+    size_t suffix_len;
+
+    if (!copy_string (dst, dst_size, name))
+        return false;
+
+    name_len = strlen (dst);
+    suffix_len = strlen (ZC_CONTAINER_EXT);
+    if (name_len > suffix_len && strcmp (dst + name_len - suffix_len, ZC_CONTAINER_EXT) == 0)
+        dst[name_len - suffix_len] = '\0';
+
+    return true;
 }
 
 static bool
@@ -571,6 +682,1415 @@ ensure_directory_exists (const char *path)
         return false;
 
     return stat (path, &st) == 0 && S_ISDIR (st.st_mode);
+}
+
+static bool
+ensure_parent_directory_exists (const char *path)
+{
+    char parent[PATH_MAX];
+
+    if (!parent_path (parent, sizeof (parent), path))
+    {
+        errno = ENAMETOOLONG;
+        return false;
+    }
+
+    return ensure_directory_exists (parent);
+}
+
+static int
+write_full (int fd, const void *buf, size_t count)
+{
+    const unsigned char *bytes = buf;
+
+    while (count > 0)
+    {
+        ssize_t written = write (fd, bytes, count);
+
+        if (written < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+
+        bytes += (size_t) written;
+        count -= (size_t) written;
+    }
+
+    return 0;
+}
+
+static int
+read_full (int fd, void *buf, size_t count)
+{
+    unsigned char *bytes = buf;
+
+    while (count > 0)
+    {
+        ssize_t nread = read (fd, bytes, count);
+
+        if (nread == 0)
+        {
+            errno = EINVAL;
+            return -1;
+        }
+        if (nread < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+
+        bytes += (size_t) nread;
+        count -= (size_t) nread;
+    }
+
+    return 0;
+}
+
+static int
+write_u32_le (int fd, uint32_t value)
+{
+    unsigned char bytes[4];
+
+    bytes[0] = (unsigned char) (value & 0xffu);
+    bytes[1] = (unsigned char) ((value >> 8) & 0xffu);
+    bytes[2] = (unsigned char) ((value >> 16) & 0xffu);
+    bytes[3] = (unsigned char) ((value >> 24) & 0xffu);
+    return write_full (fd, bytes, sizeof (bytes));
+}
+
+static int
+write_u64_le (int fd, uint64_t value)
+{
+    unsigned char bytes[8];
+
+    for (size_t i = 0; i < sizeof (bytes); i++)
+        bytes[i] = (unsigned char) ((value >> (i * 8)) & 0xffu);
+    return write_full (fd, bytes, sizeof (bytes));
+}
+
+static int
+read_u32_le (int fd, uint32_t *value)
+{
+    unsigned char bytes[4];
+
+    if (read_full (fd, bytes, sizeof (bytes)) == -1)
+        return -1;
+
+    *value = (uint32_t) bytes[0] | ((uint32_t) bytes[1] << 8) | ((uint32_t) bytes[2] << 16)
+             | ((uint32_t) bytes[3] << 24);
+    return 0;
+}
+
+static int
+read_u64_le (int fd, uint64_t *value)
+{
+    unsigned char bytes[8];
+
+    if (read_full (fd, bytes, sizeof (bytes)) == -1)
+        return -1;
+
+    *value = 0;
+    for (size_t i = 0; i < sizeof (bytes); i++)
+        *value |= (uint64_t) bytes[i] << (i * 8);
+    return 0;
+}
+
+static int
+copy_n_bytes (int in_fd, int out_fd, uint64_t count)
+{
+    char buffer[8192];
+
+    while (count > 0)
+    {
+        size_t chunk = count < sizeof (buffer) ? (size_t) count : sizeof (buffer);
+
+        if (read_full (in_fd, buffer, chunk) == -1)
+            return -1;
+        if (write_full (out_fd, buffer, chunk) == -1)
+            return -1;
+        count -= (uint64_t) chunk;
+    }
+
+    return 0;
+}
+
+static bool
+write_zc_container_plain_magic (int fd)
+{
+    return write_full (fd, ZC_CONTAINER_MAGIC_PLAIN, strlen (ZC_CONTAINER_MAGIC_PLAIN)) == 0;
+}
+
+static bool
+write_zc_container_encrypted_magic (int fd)
+{
+    return write_full (fd, ZC_CONTAINER_MAGIC_ENCRYPTED, strlen (ZC_CONTAINER_MAGIC_ENCRYPTED)) == 0;
+}
+
+static bool
+read_zc_container_kind (int fd, ZcContainerKind *kind)
+{
+    char magic[sizeof (ZC_CONTAINER_MAGIC_ENCRYPTED)];
+
+    if (read_full (fd, magic, strlen (ZC_CONTAINER_MAGIC_ENCRYPTED)) == -1)
+        return false;
+    magic[strlen (ZC_CONTAINER_MAGIC_ENCRYPTED)] = '\0';
+
+    if (strcmp (magic, ZC_CONTAINER_MAGIC_PLAIN) == 0)
+    {
+        *kind = ZC_CONTAINER_KIND_PLAIN;
+        return true;
+    }
+    if (strcmp (magic, ZC_CONTAINER_MAGIC_ENCRYPTED) == 0)
+    {
+        *kind = ZC_CONTAINER_KIND_ENCRYPTED;
+        return true;
+    }
+
+    errno = EINVAL;
+    return false;
+}
+
+static bool
+probe_zc_container_kind (const char *path, ZcContainerKind *kind)
+{
+    int fd = open (path, O_RDONLY);
+    bool ok;
+
+    if (fd == -1)
+        return false;
+    ok = read_zc_container_kind (fd, kind);
+    close (fd);
+    return ok;
+}
+
+static bool
+write_zc_container_record_header (int fd, ZcContainerRecordType type, const char *relpath,
+                                  mode_t mode, time_t mtime, uint64_t size)
+{
+    size_t path_len = relpath != NULL ? strlen (relpath) : 0;
+    unsigned char type_byte = (unsigned char) type;
+
+    if (path_len > UINT32_MAX)
+    {
+        errno = ENAMETOOLONG;
+        return false;
+    }
+
+    return write_full (fd, &type_byte, sizeof (type_byte)) == 0
+           && write_u32_le (fd, (uint32_t) path_len) == 0
+           && write_u32_le (fd, (uint32_t) mode) == 0
+           && write_u64_le (fd, (uint64_t) mtime) == 0 && write_u64_le (fd, size) == 0
+           && (path_len == 0 || write_full (fd, relpath, path_len) == 0);
+}
+
+static bool
+write_zc_container_end_record (int fd)
+{
+    return write_zc_container_record_header (fd, ZC_CONTAINER_RECORD_END, NULL, 0, 0, 0);
+}
+
+static void
+ab_append_u32_le (AppendBuffer *ab, uint32_t value)
+{
+    unsigned char bytes[4];
+
+    bytes[0] = (unsigned char) (value & 0xffu);
+    bytes[1] = (unsigned char) ((value >> 8) & 0xffu);
+    bytes[2] = (unsigned char) ((value >> 16) & 0xffu);
+    bytes[3] = (unsigned char) ((value >> 24) & 0xffu);
+    ab_append (ab, (const char *) bytes, sizeof (bytes));
+}
+
+static void
+ab_append_u64_le (AppendBuffer *ab, uint64_t value)
+{
+    unsigned char bytes[8];
+
+    for (size_t i = 0; i < sizeof (bytes); i++)
+        bytes[i] = (unsigned char) ((value >> (i * 8)) & 0xffu);
+    ab_append (ab, (const char *) bytes, sizeof (bytes));
+}
+
+static bool
+read_u32_le_from_memory (const unsigned char **cursor, const unsigned char *end, uint32_t *value)
+{
+    const unsigned char *p = *cursor;
+
+    if ((size_t) (end - p) < 4)
+        return false;
+    *value = (uint32_t) p[0] | ((uint32_t) p[1] << 8) | ((uint32_t) p[2] << 16)
+             | ((uint32_t) p[3] << 24);
+    *cursor += 4;
+    return true;
+}
+
+static bool
+read_u64_le_from_memory (const unsigned char **cursor, const unsigned char *end, uint64_t *value)
+{
+    const unsigned char *p = *cursor;
+
+    if ((size_t) (end - p) < 8)
+        return false;
+
+    *value = 0;
+    for (size_t i = 0; i < 8; i++)
+        *value |= (uint64_t) p[i] << (i * 8);
+    *cursor += 8;
+    return true;
+}
+
+static char *
+dup_string (const char *src)
+{
+    size_t len = strlen (src) + 1;
+    char *copy = malloc (len);
+
+    if (copy == NULL)
+        die ("malloc");
+    memcpy (copy, src, len);
+    return copy;
+}
+
+static void
+zc_container_item_list_init (ZcContainerItemList *list)
+{
+    list->items = NULL;
+    list->len = 0;
+    list->cap = 0;
+}
+
+static void
+zc_container_item_list_free (ZcContainerItemList *list)
+{
+    for (size_t i = 0; i < list->len; i++)
+    {
+        free (list->items[i].src_path);
+        free (list->items[i].relpath);
+    }
+    free (list->items);
+    list->items = NULL;
+    list->len = 0;
+    list->cap = 0;
+}
+
+static void
+zc_container_item_list_push (ZcContainerItemList *list, ZcContainerRecordType type,
+                             const char *src_path, const char *relpath, mode_t mode, time_t mtime,
+                             uint64_t size)
+{
+    ZcContainerItem *item;
+
+    if (list->len == list->cap)
+    {
+        size_t new_cap = list->cap == 0 ? 16 : list->cap * 2;
+        ZcContainerItem *new_items = realloc (list->items, sizeof (*list->items) * new_cap);
+
+        if (new_items == NULL)
+            die ("realloc");
+        list->items = new_items;
+        list->cap = new_cap;
+    }
+
+    item = &list->items[list->len++];
+    item->type = type;
+    item->src_path = dup_string (src_path);
+    item->relpath = dup_string (relpath);
+    item->mode = mode;
+    item->mtime = mtime;
+    item->size = size;
+}
+
+static bool
+is_safe_container_relpath (const char *path)
+{
+    const char *segment = path;
+
+    if (path == NULL || path[0] == '\0' || path[0] == '/')
+        return false;
+
+    while (*segment != '\0')
+    {
+        const char *end = strchr (segment, '/');
+        size_t len = end != NULL ? (size_t) (end - segment) : strlen (segment);
+
+        if (len == 0 || (len == 1 && segment[0] == '.')
+            || (len == 2 && segment[0] == '.' && segment[1] == '.'))
+            return false;
+
+        if (end == NULL)
+            break;
+        segment = end + 1;
+    }
+
+    return true;
+}
+
+static bool
+collect_path_for_zc_container (ZcContainerItemList *items, const char *src_path, const char *relpath)
+{
+    struct stat st;
+
+    if (!is_safe_container_relpath (relpath))
+    {
+        errno = EINVAL;
+        return false;
+    }
+
+    if (lstat (src_path, &st) == -1)
+        return false;
+
+    if (S_ISDIR (st.st_mode))
+    {
+        DIR *dir;
+        struct dirent *direntp;
+
+        zc_container_item_list_push (items, ZC_CONTAINER_RECORD_DIR, src_path, relpath, st.st_mode,
+                                     st.st_mtime, 0);
+
+        dir = opendir (src_path);
+        if (dir == NULL)
+            return false;
+
+        while ((direntp = readdir (dir)) != NULL)
+        {
+            char src_child[PATH_MAX];
+            char rel_child[PATH_MAX];
+            bool ok;
+
+            if (strcmp (direntp->d_name, ".") == 0 || strcmp (direntp->d_name, "..") == 0)
+                continue;
+            if (!join_path (src_child, sizeof (src_child), src_path, direntp->d_name)
+                || !join_path (rel_child, sizeof (rel_child), relpath, direntp->d_name))
+            {
+                closedir (dir);
+                errno = ENAMETOOLONG;
+                return false;
+            }
+
+            ok = collect_path_for_zc_container (items, src_child, rel_child);
+            if (!ok)
+            {
+                closedir (dir);
+                return false;
+            }
+        }
+
+        closedir (dir);
+        return true;
+    }
+
+    if (S_ISLNK (st.st_mode))
+    {
+        char target[PATH_MAX];
+        ssize_t len = readlink (src_path, target, sizeof (target) - 1);
+
+        if (len < 0)
+            return false;
+
+        zc_container_item_list_push (items, ZC_CONTAINER_RECORD_SYMLINK, src_path, relpath,
+                                     st.st_mode, st.st_mtime, (uint64_t) len);
+        return true;
+    }
+
+    if (S_ISREG (st.st_mode))
+    {
+        zc_container_item_list_push (items, ZC_CONTAINER_RECORD_FILE, src_path, relpath, st.st_mode,
+                                     st.st_mtime, (uint64_t) st.st_size);
+        return true;
+    }
+
+    errno = ENOTSUP;
+    return false;
+}
+
+static bool
+serialize_encrypted_manifest (const ZcContainerItemList *items, AppendBuffer *manifest)
+{
+    if (items->len > UINT32_MAX)
+    {
+        errno = EINVAL;
+        return false;
+    }
+
+    ab_append (manifest, ZC_MANIFEST_MAGIC, strlen (ZC_MANIFEST_MAGIC));
+    ab_append_u32_le (manifest, (uint32_t) items->len);
+
+    for (size_t i = 0; i < items->len; i++)
+    {
+        const ZcContainerItem *item = &items->items[i];
+        size_t relpath_len = strlen (item->relpath);
+        unsigned char type = (unsigned char) item->type;
+
+        if (relpath_len == 0 || relpath_len > UINT32_MAX)
+        {
+            errno = ENAMETOOLONG;
+            return false;
+        }
+
+        ab_append (manifest, (const char *) &type, sizeof (type));
+        ab_append_u32_le (manifest, (uint32_t) (item->mode & 07777u));
+        ab_append_u64_le (manifest, (uint64_t) item->mtime);
+        ab_append_u64_le (manifest, item->size);
+        ab_append_u32_le (manifest, (uint32_t) relpath_len);
+        ab_append (manifest, item->relpath, relpath_len);
+    }
+
+    return true;
+}
+
+static bool
+parse_encrypted_manifest (const unsigned char *data, size_t data_len, ZcContainerItemList *items)
+{
+    const unsigned char *cursor = data;
+    const unsigned char *end = data + data_len;
+    uint32_t count;
+
+    if (data_len < strlen (ZC_MANIFEST_MAGIC) + 4
+        || memcmp (cursor, ZC_MANIFEST_MAGIC, strlen (ZC_MANIFEST_MAGIC)) != 0)
+    {
+        errno = EINVAL;
+        set_container_error ("Unsupported encrypted manifest");
+        return false;
+    }
+
+    cursor += strlen (ZC_MANIFEST_MAGIC);
+    if (!read_u32_le_from_memory (&cursor, end, &count))
+    {
+        errno = EINVAL;
+        set_container_error ("Corrupt encrypted manifest");
+        return false;
+    }
+
+    for (uint32_t i = 0; i < count; i++)
+    {
+        ZcContainerRecordType type;
+        uint32_t mode_value;
+        uint64_t mtime_value;
+        uint64_t size;
+        uint32_t relpath_len;
+        char *relpath;
+
+        if (cursor >= end)
+        {
+            errno = EINVAL;
+            set_container_error ("Corrupt encrypted manifest");
+            return false;
+        }
+
+        type = (ZcContainerRecordType) *cursor++;
+        if ((type != ZC_CONTAINER_RECORD_DIR && type != ZC_CONTAINER_RECORD_FILE
+             && type != ZC_CONTAINER_RECORD_SYMLINK)
+            || !read_u32_le_from_memory (&cursor, end, &mode_value)
+            || !read_u64_le_from_memory (&cursor, end, &mtime_value)
+            || !read_u64_le_from_memory (&cursor, end, &size)
+            || !read_u32_le_from_memory (&cursor, end, &relpath_len)
+            || relpath_len == 0 || relpath_len >= PATH_MAX
+            || (size_t) (end - cursor) < relpath_len)
+        {
+            errno = EINVAL;
+            set_container_error ("Corrupt encrypted manifest");
+            return false;
+        }
+
+        relpath = malloc ((size_t) relpath_len + 1);
+        if (relpath == NULL)
+            die ("malloc");
+        memcpy (relpath, cursor, relpath_len);
+        relpath[relpath_len] = '\0';
+        cursor += relpath_len;
+
+        if (!is_safe_container_relpath (relpath))
+        {
+            free (relpath);
+            errno = EINVAL;
+            set_container_error ("Unsafe encrypted manifest path");
+            return false;
+        }
+
+        zc_container_item_list_push (items, type, "", relpath, (mode_t) mode_value,
+                                     (time_t) mtime_value, size);
+        free (relpath);
+    }
+
+    if (cursor != end)
+    {
+        errno = EINVAL;
+        set_container_error ("Trailing encrypted manifest data");
+        return false;
+    }
+
+    return true;
+}
+
+static bool
+apply_mtime_to_path (const char *path, time_t mtime)
+{
+    struct utimbuf times;
+
+    times.actime = mtime;
+    times.modtime = mtime;
+    return utime (path, &times) == 0;
+}
+
+static bool
+fill_random_bytes (void *buf, size_t len)
+{
+    int fd = open ("/dev/urandom", O_RDONLY);
+    bool ok;
+
+    if (fd == -1)
+        return false;
+    ok = read_full (fd, buf, len) == 0;
+    close (fd);
+    return ok;
+}
+
+static bool
+constant_time_equal (const unsigned char *left, const unsigned char *right, size_t len)
+{
+    if (len == 16)
+        return crypto_verify16 (left, right) == 0;
+    if (len == 32)
+        return crypto_verify32 (left, right) == 0;
+    if (len == 64)
+        return crypto_verify64 (left, right) == 0;
+
+    for (size_t i = 0; i < len; i++)
+    {
+        if (left[i] != right[i])
+            return false;
+    }
+    return true;
+}
+
+static void
+derive_labeled_key (const unsigned char *key, size_t key_len, const char *label,
+                    unsigned char out[ZC_KEY_LEN])
+{
+    crypto_blake2b_keyed (out, ZC_KEY_LEN, key, key_len, (const uint8_t *) label, strlen (label));
+}
+
+static void
+derive_payload_keys (const unsigned char payload_master_key[ZC_KEY_LEN], size_t payload_index,
+                     unsigned char enc_key[ZC_KEY_LEN], unsigned char mac_key[ZC_KEY_LEN])
+{
+    unsigned char payload_id[8];
+    unsigned char seed[32];
+    unsigned char digest[ZC_KEY_LEN];
+    const char *enc_label = "payload-enc";
+    const char *mac_label = "payload-mac";
+    size_t enc_len = strlen (enc_label);
+    size_t mac_len = strlen (mac_label);
+
+    for (size_t i = 0; i < sizeof (payload_id); i++)
+        payload_id[i] = (unsigned char) ((payload_index >> (i * 8)) & 0xffu);
+
+    memcpy (seed, enc_label, enc_len);
+    memcpy (seed + enc_len, payload_id, sizeof (payload_id));
+    crypto_blake2b_keyed (digest, ZC_KEY_LEN, payload_master_key, ZC_KEY_LEN, seed,
+                          enc_len + sizeof (payload_id));
+    memcpy (enc_key, digest, ZC_KEY_LEN);
+
+    memcpy (seed, mac_label, mac_len);
+    memcpy (seed + mac_len, payload_id, sizeof (payload_id));
+    crypto_blake2b_keyed (mac_key, ZC_KEY_LEN, payload_master_key, ZC_KEY_LEN, seed,
+                          mac_len + sizeof (payload_id));
+    secure_zero (digest, sizeof (digest));
+    secure_zero (seed, sizeof (seed));
+}
+
+static bool
+derive_encrypted_keyset (const char *passphrase, const unsigned char salt[ZC_SALT_LEN],
+                         uint32_t algorithm, uint32_t nb_blocks, uint32_t nb_passes,
+                         uint32_t nb_lanes, ZcEncryptedKeyset *keys)
+{
+    unsigned char master[ZC_KEY_LEN];
+    crypto_argon2_config config;
+    crypto_argon2_inputs inputs;
+    size_t work_area_size;
+    void *work_area;
+
+    if (algorithm > CRYPTO_ARGON2_ID || nb_blocks < 8 || nb_passes == 0 || nb_lanes == 0)
+    {
+        errno = EINVAL;
+        set_container_error ("Unsupported encrypted container parameters");
+        return false;
+    }
+
+    config.algorithm = algorithm;
+    config.nb_blocks = nb_blocks;
+    config.nb_passes = nb_passes;
+    config.nb_lanes = nb_lanes;
+
+    inputs.pass = (const uint8_t *) passphrase;
+    inputs.salt = salt;
+    inputs.pass_size = (uint32_t) strlen (passphrase);
+    inputs.salt_size = ZC_SALT_LEN;
+
+    work_area_size = (size_t) nb_blocks * 1024u;
+    work_area = malloc (work_area_size);
+    if (work_area == NULL)
+    {
+        errno = ENOMEM;
+        set_container_error ("Cannot allocate Argon2 workspace");
+        return false;
+    }
+
+    crypto_argon2 (master, ZC_KEY_LEN, work_area, config, inputs, crypto_argon2_no_extras);
+    crypto_wipe (work_area, work_area_size);
+    free (work_area);
+
+    derive_labeled_key (master, sizeof (master), "manifest-enc", keys->manifest_enc_key);
+    derive_labeled_key (master, sizeof (master), "manifest-mac", keys->manifest_mac_key);
+    derive_labeled_key (master, sizeof (master), "payload-master", keys->payload_master_key);
+    crypto_wipe (master, sizeof (master));
+    return true;
+}
+
+static void
+tag_update_u64_le (crypto_blake2b_ctx *ctx, uint64_t value)
+{
+    unsigned char bytes[8];
+
+    for (size_t i = 0; i < sizeof (bytes); i++)
+        bytes[i] = (unsigned char) ((value >> (i * 8)) & 0xffu);
+    crypto_blake2b_update (ctx, bytes, sizeof (bytes));
+}
+
+static void
+tag_begin_payload (crypto_blake2b_ctx *ctx, const unsigned char *mac_key, const char *label,
+                   const unsigned char nonce[ZC_NONCE_LEN], uint64_t ciphertext_len)
+{
+    crypto_blake2b_keyed_init (ctx, ZC_TAG_LEN, mac_key, ZC_KEY_LEN);
+    crypto_blake2b_update (ctx, (const uint8_t *) label, strlen (label));
+    crypto_blake2b_update (ctx, nonce, ZC_NONCE_LEN);
+    tag_update_u64_le (ctx, ciphertext_len);
+}
+
+static bool
+encrypt_buffer_to_container (int out_fd, const unsigned char *plain, size_t plain_len,
+                             const unsigned char enc_key[ZC_KEY_LEN],
+                             const unsigned char mac_key[ZC_KEY_LEN], const char *label)
+{
+    unsigned char nonce[ZC_NONCE_LEN];
+    unsigned char tag[ZC_TAG_LEN];
+    unsigned char *cipher = NULL;
+    crypto_blake2b_ctx tag_ctx;
+    bool ok = false;
+
+    if (!fill_random_bytes (nonce, sizeof (nonce)))
+        return false;
+
+    cipher = malloc (plain_len == 0 ? 1 : plain_len);
+    if (cipher == NULL)
+        die ("malloc");
+
+    (void) crypto_chacha20_x (cipher, plain, plain_len, enc_key, nonce, 0);
+
+    tag_begin_payload (&tag_ctx, mac_key, label, nonce, (uint64_t) plain_len);
+    if (plain_len > 0)
+        crypto_blake2b_update (&tag_ctx, cipher, plain_len);
+    crypto_blake2b_final (&tag_ctx, tag);
+
+    ok = write_full (out_fd, nonce, sizeof (nonce)) == 0
+         && write_u64_le (out_fd, (uint64_t) plain_len) == 0
+         && write_full (out_fd, tag, sizeof (tag)) == 0
+         && (plain_len == 0 || write_full (out_fd, cipher, plain_len) == 0);
+
+    if (cipher != NULL)
+    {
+        crypto_wipe (cipher, plain_len == 0 ? 1 : plain_len);
+        free (cipher);
+    }
+    crypto_wipe (tag, sizeof (tag));
+    crypto_wipe (nonce, sizeof (nonce));
+    return ok;
+}
+
+static bool
+decrypt_buffer_from_container (int in_fd, unsigned char **out_plain, size_t *out_len,
+                               const unsigned char enc_key[ZC_KEY_LEN],
+                               const unsigned char mac_key[ZC_KEY_LEN], const char *label)
+{
+    unsigned char nonce[ZC_NONCE_LEN];
+    unsigned char expected_tag[ZC_TAG_LEN];
+    unsigned char actual_tag[ZC_TAG_LEN];
+    unsigned char *cipher = NULL;
+    unsigned char *plain = NULL;
+    uint64_t cipher_len64;
+    size_t cipher_len;
+    crypto_blake2b_ctx tag_ctx;
+    bool ok = false;
+
+    *out_plain = NULL;
+    *out_len = 0;
+
+    if (read_full (in_fd, nonce, sizeof (nonce)) == -1 || read_u64_le (in_fd, &cipher_len64) == -1
+        || read_full (in_fd, expected_tag, sizeof (expected_tag)) == -1)
+        return false;
+
+    if (cipher_len64 > SIZE_MAX)
+    {
+        errno = EINVAL;
+        set_container_error ("Encrypted manifest too large");
+        return false;
+    }
+    cipher_len = (size_t) cipher_len64;
+
+    cipher = malloc (cipher_len == 0 ? 1 : cipher_len);
+    plain = malloc (cipher_len == 0 ? 1 : cipher_len);
+    if (cipher == NULL || plain == NULL)
+        die ("malloc");
+
+    if (cipher_len > 0 && read_full (in_fd, cipher, cipher_len) == -1)
+        goto out;
+
+    tag_begin_payload (&tag_ctx, mac_key, label, nonce, cipher_len64);
+    if (cipher_len > 0)
+        crypto_blake2b_update (&tag_ctx, cipher, cipher_len);
+    crypto_blake2b_final (&tag_ctx, actual_tag);
+
+    if (!constant_time_equal (expected_tag, actual_tag, sizeof (actual_tag)))
+    {
+        errno = EACCES;
+        set_container_error ("Wrong passphrase or modified encrypted container");
+        goto out;
+    }
+
+    (void) crypto_chacha20_x (plain, cipher, cipher_len, enc_key, nonce, 0);
+
+    *out_plain = plain;
+    *out_len = cipher_len;
+    plain = NULL;
+    ok = true;
+
+out:
+    if (cipher != NULL)
+    {
+        crypto_wipe (cipher, cipher_len == 0 ? 1 : cipher_len);
+        free (cipher);
+    }
+    if (plain != NULL)
+    {
+        crypto_wipe (plain, cipher_len == 0 ? 1 : cipher_len);
+        free (plain);
+    }
+    crypto_wipe (actual_tag, sizeof (actual_tag));
+    crypto_wipe (expected_tag, sizeof (expected_tag));
+    crypto_wipe (nonce, sizeof (nonce));
+    return ok;
+}
+
+static bool
+encrypt_file_payload_to_container (int out_fd, const char *src_path, uint64_t plain_size,
+                                   const unsigned char enc_key[ZC_KEY_LEN],
+                                   const unsigned char mac_key[ZC_KEY_LEN], const char *label)
+{
+    unsigned char nonce[ZC_NONCE_LEN];
+    unsigned char tag[ZC_TAG_LEN];
+    unsigned char zero_tag[ZC_TAG_LEN] = { 0 };
+    int in_fd = -1;
+    crypto_blake2b_ctx tag_ctx;
+    off_t tag_offset;
+    bool ok = false;
+    uint64_t counter = 0;
+
+    if (!fill_random_bytes (nonce, sizeof (nonce)))
+        return false;
+
+    in_fd = open (src_path, O_RDONLY);
+    if (in_fd == -1)
+        return false;
+
+    if (write_full (out_fd, nonce, sizeof (nonce)) == -1 || write_u64_le (out_fd, plain_size) == -1)
+        goto out;
+
+    tag_offset = lseek (out_fd, 0, SEEK_CUR);
+    if (tag_offset == (off_t) -1 || write_full (out_fd, zero_tag, sizeof (zero_tag)) == -1)
+        goto out;
+
+    tag_begin_payload (&tag_ctx, mac_key, label, nonce, plain_size);
+    while (plain_size > 0)
+    {
+        unsigned char in_buf[8192];
+        unsigned char out_buf[8192];
+        size_t chunk = plain_size < sizeof (in_buf) ? (size_t) plain_size : sizeof (in_buf);
+
+        if (read_full (in_fd, in_buf, chunk) == -1)
+        {
+            crypto_wipe (in_buf, sizeof (in_buf));
+            goto out;
+        }
+
+        counter = crypto_chacha20_x (out_buf, in_buf, chunk, enc_key, nonce, counter);
+        if (write_full (out_fd, out_buf, chunk) == -1)
+        {
+            crypto_wipe (in_buf, sizeof (in_buf));
+            crypto_wipe (out_buf, sizeof (out_buf));
+            goto out;
+        }
+
+        crypto_blake2b_update (&tag_ctx, out_buf, chunk);
+        crypto_wipe (in_buf, sizeof (in_buf));
+        crypto_wipe (out_buf, sizeof (out_buf));
+        plain_size -= (uint64_t) chunk;
+    }
+
+    crypto_blake2b_final (&tag_ctx, tag);
+    if (lseek (out_fd, tag_offset, SEEK_SET) == (off_t) -1 || write_full (out_fd, tag, sizeof (tag)) == -1
+        || lseek (out_fd, 0, SEEK_END) == (off_t) -1)
+        goto out;
+
+    ok = true;
+
+out:
+    if (in_fd != -1)
+        close (in_fd);
+    crypto_wipe (nonce, sizeof (nonce));
+    crypto_wipe (tag, sizeof (tag));
+    return ok;
+}
+
+static bool
+verify_payload_tag_from_fd (int fd, off_t ciphertext_offset, uint64_t ciphertext_len,
+                            const unsigned char nonce[ZC_NONCE_LEN],
+                            const unsigned char expected_tag[ZC_TAG_LEN],
+                            const unsigned char mac_key[ZC_KEY_LEN], const char *label)
+{
+    unsigned char actual_tag[ZC_TAG_LEN];
+    crypto_blake2b_ctx tag_ctx;
+
+    if (lseek (fd, ciphertext_offset, SEEK_SET) == (off_t) -1)
+        return false;
+
+    tag_begin_payload (&tag_ctx, mac_key, label, nonce, ciphertext_len);
+    while (ciphertext_len > 0)
+    {
+        unsigned char buffer[8192];
+        size_t chunk = ciphertext_len < sizeof (buffer) ? (size_t) ciphertext_len : sizeof (buffer);
+
+        if (read_full (fd, buffer, chunk) == -1)
+        {
+            crypto_wipe (buffer, sizeof (buffer));
+            return false;
+        }
+        crypto_blake2b_update (&tag_ctx, buffer, chunk);
+        crypto_wipe (buffer, sizeof (buffer));
+        ciphertext_len -= (uint64_t) chunk;
+    }
+    crypto_blake2b_final (&tag_ctx, actual_tag);
+
+    if (!constant_time_equal (expected_tag, actual_tag, sizeof (actual_tag)))
+    {
+        crypto_wipe (actual_tag, sizeof (actual_tag));
+        errno = EACCES;
+        set_container_error ("Wrong passphrase or modified encrypted container");
+        return false;
+    }
+
+    crypto_wipe (actual_tag, sizeof (actual_tag));
+    return true;
+}
+
+static bool
+decrypt_payload_to_file (int fd, const char *dst_path, mode_t mode, time_t mtime,
+                         const unsigned char enc_key[ZC_KEY_LEN],
+                         const unsigned char mac_key[ZC_KEY_LEN], const char *label)
+{
+    unsigned char nonce[ZC_NONCE_LEN];
+    unsigned char tag[ZC_TAG_LEN];
+    uint64_t cipher_len;
+    off_t cipher_offset;
+    int out_fd = -1;
+    bool ok = false;
+    uint64_t counter = 0;
+
+    if (read_full (fd, nonce, sizeof (nonce)) == -1 || read_u64_le (fd, &cipher_len) == -1
+        || read_full (fd, tag, sizeof (tag)) == -1)
+        return false;
+
+    cipher_offset = lseek (fd, 0, SEEK_CUR);
+    if (cipher_offset == (off_t) -1)
+        return false;
+
+    if (!verify_payload_tag_from_fd (fd, cipher_offset, cipher_len, nonce, tag, mac_key, label)
+        || lseek (fd, cipher_offset, SEEK_SET) == (off_t) -1 || !ensure_parent_directory_exists (dst_path))
+        goto out;
+
+    out_fd = open (dst_path, O_WRONLY | O_CREAT | O_EXCL | O_TRUNC,
+                   (mode_t) ((mode & 0777u) != 0 ? (mode & 0777u) : 0644u));
+    if (out_fd == -1)
+        goto out;
+
+    while (cipher_len > 0)
+    {
+        unsigned char in_buf[8192];
+        unsigned char out_buf[8192];
+        size_t chunk = cipher_len < sizeof (in_buf) ? (size_t) cipher_len : sizeof (in_buf);
+
+        if (read_full (fd, in_buf, chunk) == -1)
+        {
+            crypto_wipe (in_buf, sizeof (in_buf));
+            goto out;
+        }
+
+        counter = crypto_chacha20_x (out_buf, in_buf, chunk, enc_key, nonce, counter);
+        if (write_full (out_fd, out_buf, chunk) == -1)
+        {
+            crypto_wipe (in_buf, sizeof (in_buf));
+            crypto_wipe (out_buf, sizeof (out_buf));
+            goto out;
+        }
+
+        crypto_wipe (in_buf, sizeof (in_buf));
+        crypto_wipe (out_buf, sizeof (out_buf));
+        cipher_len -= (uint64_t) chunk;
+    }
+
+    (void) apply_mtime_to_path (dst_path, mtime);
+    ok = true;
+
+out:
+    if (out_fd != -1)
+        close (out_fd);
+    crypto_wipe (nonce, sizeof (nonce));
+    crypto_wipe (tag, sizeof (tag));
+    return ok;
+}
+
+static bool
+decrypt_payload_to_symlink (int fd, const char *dst_path,
+                            const unsigned char enc_key[ZC_KEY_LEN],
+                            const unsigned char mac_key[ZC_KEY_LEN], const char *label)
+{
+    unsigned char nonce[ZC_NONCE_LEN];
+    unsigned char tag[ZC_TAG_LEN];
+    unsigned char *cipher = NULL;
+    unsigned char *plain = NULL;
+    uint64_t cipher_len64;
+    size_t cipher_len = 0;
+    off_t cipher_offset;
+    bool ok = false;
+
+    if (read_full (fd, nonce, sizeof (nonce)) == -1 || read_u64_le (fd, &cipher_len64) == -1
+        || read_full (fd, tag, sizeof (tag)) == -1)
+        return false;
+    if (cipher_len64 > PATH_MAX)
+    {
+        errno = EINVAL;
+        set_container_error ("Encrypted symlink target too large");
+        return false;
+    }
+
+    cipher_len = (size_t) cipher_len64;
+    cipher_offset = lseek (fd, 0, SEEK_CUR);
+    if (cipher_offset == (off_t) -1
+        || !verify_payload_tag_from_fd (fd, cipher_offset, cipher_len64, nonce, tag, mac_key, label)
+        || lseek (fd, cipher_offset, SEEK_SET) == (off_t) -1)
+        goto out;
+
+    cipher = malloc (cipher_len == 0 ? 1 : cipher_len);
+    plain = malloc (cipher_len + 1);
+    if (cipher == NULL || plain == NULL)
+        die ("malloc");
+
+    if (cipher_len > 0 && read_full (fd, cipher, cipher_len) == -1)
+        goto out;
+    (void) crypto_chacha20_x (plain, cipher, cipher_len, enc_key, nonce, 0);
+    plain[cipher_len] = '\0';
+
+    if (!ensure_parent_directory_exists (dst_path) || symlink ((char *) plain, dst_path) == -1)
+        goto out;
+    ok = true;
+
+out:
+    if (cipher != NULL)
+    {
+        crypto_wipe (cipher, cipher_len == 0 ? 1 : cipher_len);
+        free (cipher);
+    }
+    if (plain != NULL)
+    {
+        crypto_wipe (plain, cipher_len + 1);
+        free (plain);
+    }
+    crypto_wipe (nonce, sizeof (nonce));
+    crypto_wipe (tag, sizeof (tag));
+    return ok;
+}
+
+static bool
+append_path_to_zc_container (int fd, const char *src_path, const char *relpath)
+{
+    struct stat st;
+
+    if (!is_safe_container_relpath (relpath))
+    {
+        errno = EINVAL;
+        return false;
+    }
+
+    if (lstat (src_path, &st) == -1)
+        return false;
+
+    if (S_ISDIR (st.st_mode))
+    {
+        DIR *dir;
+        struct dirent *direntp;
+
+        if (!write_zc_container_record_header (fd, ZC_CONTAINER_RECORD_DIR, relpath, st.st_mode,
+                                               st.st_mtime, 0))
+            return false;
+
+        dir = opendir (src_path);
+        if (dir == NULL)
+            return false;
+
+        while ((direntp = readdir (dir)) != NULL)
+        {
+            char src_child[PATH_MAX];
+            char rel_child[PATH_MAX];
+            bool ok;
+
+            if (strcmp (direntp->d_name, ".") == 0 || strcmp (direntp->d_name, "..") == 0)
+                continue;
+            if (!join_path (src_child, sizeof (src_child), src_path, direntp->d_name)
+                || !join_path (rel_child, sizeof (rel_child), relpath, direntp->d_name))
+            {
+                closedir (dir);
+                errno = ENAMETOOLONG;
+                return false;
+            }
+
+            ok = append_path_to_zc_container (fd, src_child, rel_child);
+            if (!ok)
+            {
+                closedir (dir);
+                return false;
+            }
+        }
+
+        closedir (dir);
+        return true;
+    }
+
+    if (S_ISLNK (st.st_mode))
+    {
+        char target[PATH_MAX];
+        ssize_t len = readlink (src_path, target, sizeof (target) - 1);
+
+        if (len < 0)
+            return false;
+        target[len] = '\0';
+
+        return write_zc_container_record_header (fd, ZC_CONTAINER_RECORD_SYMLINK, relpath,
+                                                 st.st_mode, st.st_mtime, (uint64_t) len)
+               && write_full (fd, target, (size_t) len) == 0;
+    }
+
+    if (S_ISREG (st.st_mode))
+    {
+        int in_fd = open (src_path, O_RDONLY);
+        bool ok;
+
+        if (in_fd == -1)
+            return false;
+
+        ok = write_zc_container_record_header (fd, ZC_CONTAINER_RECORD_FILE, relpath, st.st_mode,
+                                               st.st_mtime, (uint64_t) st.st_size)
+             && copy_n_bytes (in_fd, fd, (uint64_t) st.st_size) == 0;
+        close (in_fd);
+        return ok;
+    }
+
+    errno = ENOTSUP;
+    return false;
+}
+
+static bool
+extract_plain_zc_container_fd (int fd, const char *dst_dir)
+{
+    bool ok = false;
+
+    if (!ensure_directory_exists (dst_dir))
+        return false;
+
+    while (true)
+    {
+        unsigned char type_byte;
+        ZcContainerRecordType type;
+        uint32_t path_len;
+        uint32_t mode_value;
+        uint64_t mtime_value;
+        uint64_t size;
+        char *relpath = NULL;
+        char out_path[PATH_MAX];
+
+        if (read_full (fd, &type_byte, sizeof (type_byte)) == -1)
+            goto out;
+
+        type = (ZcContainerRecordType) type_byte;
+        if (read_u32_le (fd, &path_len) == -1 || read_u32_le (fd, &mode_value) == -1
+            || read_u64_le (fd, &mtime_value) == -1 || read_u64_le (fd, &size) == -1)
+            goto out;
+
+        if (type == ZC_CONTAINER_RECORD_END)
+        {
+            if (path_len != 0 || mode_value != 0 || mtime_value != 0 || size != 0)
+            {
+                errno = EINVAL;
+                goto out;
+            }
+            ok = true;
+            break;
+        }
+
+        if (path_len == 0 || path_len >= PATH_MAX)
+        {
+            errno = ENAMETOOLONG;
+            goto out;
+        }
+
+        relpath = malloc ((size_t) path_len + 1);
+        if (relpath == NULL)
+            die ("malloc");
+        if (read_full (fd, relpath, path_len) == -1)
+        {
+            free (relpath);
+            goto out;
+        }
+        relpath[path_len] = '\0';
+
+        if (!is_safe_container_relpath (relpath))
+        {
+            free (relpath);
+            errno = EINVAL;
+            goto out;
+        }
+
+        if (!join_path (out_path, sizeof (out_path), dst_dir, relpath))
+        {
+            free (relpath);
+            errno = ENAMETOOLONG;
+            goto out;
+        }
+
+        if (type == ZC_CONTAINER_RECORD_DIR)
+        {
+            struct stat st;
+
+            if (mkdir (out_path, mode_value & 0777u) == -1 && errno != EEXIST)
+            {
+                free (relpath);
+                goto out;
+            }
+            if (stat (out_path, &st) == -1 || !S_ISDIR (st.st_mode))
+            {
+                free (relpath);
+                errno = ENOTDIR;
+                goto out;
+            }
+        }
+        else if (type == ZC_CONTAINER_RECORD_FILE)
+        {
+            int out_fd;
+
+            if (!ensure_parent_directory_exists (out_path))
+            {
+                free (relpath);
+                goto out;
+            }
+
+            out_fd = open (out_path, O_WRONLY | O_CREAT | O_EXCL | O_TRUNC,
+                           (mode_t) (mode_value & 0777u ? mode_value & 0777u : 0644u));
+            if (out_fd == -1)
+            {
+                free (relpath);
+                goto out;
+            }
+
+            if (copy_n_bytes (fd, out_fd, size) == -1)
+            {
+                close (out_fd);
+                free (relpath);
+                goto out;
+            }
+            close (out_fd);
+            (void) apply_mtime_to_path (out_path, (time_t) mtime_value);
+        }
+        else if (type == ZC_CONTAINER_RECORD_SYMLINK)
+        {
+            char *target;
+
+            if (!ensure_parent_directory_exists (out_path))
+            {
+                free (relpath);
+                goto out;
+            }
+
+            target = malloc ((size_t) size + 1);
+            if (target == NULL)
+                die ("malloc");
+            if (read_full (fd, target, (size_t) size) == -1)
+            {
+                free (target);
+                free (relpath);
+                goto out;
+            }
+            target[size] = '\0';
+
+            if (symlink (target, out_path) == -1)
+            {
+                free (target);
+                free (relpath);
+                goto out;
+            }
+
+            free (target);
+        }
+        else
+        {
+            free (relpath);
+            errno = EINVAL;
+            goto out;
+        }
+
+        free (relpath);
+    }
+
+out:
+    return ok;
+}
+
+static bool
+extract_encrypted_zc_container_fd (int fd, const char *dst_dir, const char *passphrase)
+{
+    unsigned char salt[ZC_SALT_LEN];
+    ZcEncryptedKeyset keys;
+    unsigned char *manifest_plain = NULL;
+    size_t manifest_len = 0;
+    ZcContainerItemList items;
+    bool ok = false;
+    bool keys_ready = false;
+    uint32_t algorithm = 0;
+    uint32_t nb_blocks = 0;
+    uint32_t nb_passes = 0;
+    uint32_t nb_lanes = 0;
+
+    memset (&keys, 0, sizeof (keys));
+    zc_container_item_list_init (&items);
+    clear_container_error ();
+    if (read_u32_le (fd, &algorithm) == -1 || read_u32_le (fd, &nb_blocks) == -1
+        || read_u32_le (fd, &nb_passes) == -1 || read_u32_le (fd, &nb_lanes) == -1
+        || read_full (fd, salt, sizeof (salt)) == -1)
+        goto out;
+
+    if (!derive_encrypted_keyset (passphrase, salt, algorithm, nb_blocks, nb_passes, nb_lanes,
+                                  &keys))
+        goto out;
+    keys_ready = true;
+
+    if (!decrypt_buffer_from_container (fd, &manifest_plain, &manifest_len, keys.manifest_enc_key,
+                                        keys.manifest_mac_key, "manifest"))
+        goto out;
+
+    if (!parse_encrypted_manifest (manifest_plain, manifest_len, &items)
+        || !ensure_directory_exists (dst_dir))
+        goto out;
+
+    for (size_t i = 0, payload_index = 0; i < items.len; i++)
+    {
+        ZcContainerItem *item = &items.items[i];
+        char out_path[PATH_MAX];
+
+        if (!join_path (out_path, sizeof (out_path), dst_dir, item->relpath))
+        {
+            errno = ENAMETOOLONG;
+            goto out;
+        }
+
+        if (item->type == ZC_CONTAINER_RECORD_DIR)
+        {
+            struct stat st;
+
+            if (mkdir (out_path, item->mode & 0777u) == -1 && errno != EEXIST)
+                goto out;
+            if (stat (out_path, &st) == -1 || !S_ISDIR (st.st_mode))
+            {
+                errno = ENOTDIR;
+                goto out;
+            }
+            continue;
+        }
+
+        {
+            unsigned char enc_key[ZC_KEY_LEN];
+            unsigned char mac_key[ZC_KEY_LEN];
+
+            derive_payload_keys (keys.payload_master_key, payload_index++, enc_key, mac_key);
+            if (item->type == ZC_CONTAINER_RECORD_FILE)
+                ok = decrypt_payload_to_file (fd, out_path, item->mode, item->mtime, enc_key,
+                                              mac_key, "payload");
+            else if (item->type == ZC_CONTAINER_RECORD_SYMLINK)
+                ok = decrypt_payload_to_symlink (fd, out_path, enc_key, mac_key, "payload");
+            else
+            {
+                errno = EINVAL;
+                ok = false;
+            }
+            secure_zero (enc_key, sizeof (enc_key));
+            secure_zero (mac_key, sizeof (mac_key));
+            if (!ok)
+                goto out;
+            if (item->type == ZC_CONTAINER_RECORD_FILE)
+                (void) apply_mtime_to_path (out_path, item->mtime);
+        }
+    }
+
+    ok = true;
+
+out:
+    if (manifest_plain != NULL)
+    {
+        secure_zero (manifest_plain, manifest_len == 0 ? 1 : manifest_len);
+        free (manifest_plain);
+    }
+    zc_container_item_list_free (&items);
+    if (keys_ready)
+        secure_zero (&keys, sizeof (keys));
+    secure_zero (salt, sizeof (salt));
+    return ok;
+}
+
+static bool
+extract_zc_container_file (const char *src_path, const char *dst_dir, const char *passphrase)
+{
+    int fd = -1;
+    ZcContainerKind kind;
+    bool ok;
+
+    clear_container_error ();
+    fd = open (src_path, O_RDONLY);
+    if (fd == -1)
+        return false;
+
+    if (!read_zc_container_kind (fd, &kind))
+    {
+        close (fd);
+        return false;
+    }
+
+    if (kind == ZC_CONTAINER_KIND_PLAIN)
+        ok = extract_plain_zc_container_fd (fd, dst_dir);
+    else
+        ok = passphrase != NULL && passphrase[0] != '\0'
+             && extract_encrypted_zc_container_fd (fd, dst_dir, passphrase);
+
+    close (fd);
+    return ok;
 }
 
 static int
@@ -1283,7 +2803,7 @@ draw_screen (const char *prompt_label, const char *prompt_value)
     else
     {
         snprintf (bottom_line, sizeof (bottom_line),
-                  "[F1] Help  [F2/Ctrl-P] Pack  [Ctrl-U] Unpack  [Ctrl-N] NewFile  [Space] Mark  [Tab] Switch  "
+                  "[F1] Help  [F2/Ctrl-P] Pack  [F9] ZC Container  [Ctrl-U] Unpack  [Ctrl-N] NewFile  [Space] Mark  [Tab] Switch  "
                   "[F3/F4] View/Edit  [F5/F6] Copy/Move  [F7] Mkdir  [F8] Delete  [F10/Ctrl-Q] Quit");
         ab_appendf (&ab, "%.*s", g_app.screen_cols, bottom_line);
     }
@@ -1306,7 +2826,8 @@ draw_screen (const char *prompt_label, const char *prompt_value)
 }
 
 static bool
-prompt_input (const char *label, const char *initial, char *out, size_t out_size)
+prompt_input_ex (const char *label, const char *initial, char *out, size_t out_size,
+                 bool secret)
 {
     size_t len;
 
@@ -1322,8 +2843,19 @@ prompt_input (const char *label, const char *initial, char *out, size_t out_size
     while (true)
     {
         int key;
+        char masked[PROMPT_LEN];
+        const char *display_value = out;
 
-        draw_screen (label, out);
+        if (secret)
+        {
+            if (len >= sizeof (masked))
+                return false;
+            memset (masked, '*', len);
+            masked[len] = '\0';
+            display_value = masked;
+        }
+
+        draw_screen (label, display_value);
         key = read_key ();
 
         if (key == KEY_ENTER)
@@ -1343,6 +2875,22 @@ prompt_input (const char *label, const char *initial, char *out, size_t out_size
             out[len] = '\0';
         }
     }
+}
+
+static bool
+prompt_input (const char *label, const char *initial, char *out, size_t out_size)
+{
+    return prompt_input_ex (label, initial, out, out_size, false);
+}
+
+static bool
+prompt_secret (const char *label, char *out, size_t out_size)
+{
+    bool ok = prompt_input_ex (label, "", out, out_size, true);
+
+    if (!ok)
+        secure_zero (out, out_size);
+    return ok;
 }
 
 static bool
@@ -1377,6 +2925,7 @@ show_help_screen (void)
     ab_appendf (&ab, "\x1b[%d;1HF1         Help", row++);
     ab_appendf (&ab, "\x1b[%d;1HEnter      Open file or enter directory", row++);
     ab_appendf (&ab, "\x1b[%d;1HF2/Ctrl-P  Pack current item or selection", row++);
+    ab_appendf (&ab, "\x1b[%d;1HF9         Create plain/encrypted zc container", row++);
     ab_appendf (&ab, "\x1b[%d;1HF3         View with zc-kilo --readonly", row++);
     ab_appendf (&ab, "\x1b[%d;1HF4         Edit with zc-kilo", row++);
     ab_appendf (&ab, "\x1b[%d;1HF5         Copy", row++);
@@ -1386,7 +2935,7 @@ show_help_screen (void)
     ab_appendf (&ab, "\x1b[%d;1HF10        Quit", row++);
     ab_appendf (&ab, "\x1b[%d;1HCtrl-N     Create empty file", row++);
     ab_appendf (&ab, "\x1b[%d;1HCtrl-Q     Quit", row++);
-    ab_appendf (&ab, "\x1b[%d;1HCtrl-U     Unpack selected archive", row++);
+    ab_appendf (&ab, "\x1b[%d;1HCtrl-U     Unpack archive or extract zc container", row++);
     ab_appendf (&ab, "\x1b[%d;1HSpace      Mark/unmark current entry", row++);
     ab_appendf (&ab, "\x1b[%d;1H*          Mark/unmark all entries", row++);
     ab_appendf (&ab, "\x1b[%d;1HTab        Switch panel", row++);
@@ -1636,6 +3185,338 @@ selected_full_path (Panel *panel, char *dst, size_t dst_size)
     Entry *entry = panel_selected_entry (panel);
 
     return entry_full_path (panel, entry, dst, dst_size);
+}
+
+static bool
+extract_zc_container_path_with_prompt (const char *src_path, const char *display_name,
+                                       const char *default_base)
+{
+    Panel *panel = &g_app.panels[g_app.active_panel];
+    char default_dir[PATH_MAX];
+    char dst_dir[PATH_MAX];
+    char passphrase[PROMPT_LEN];
+    ZcContainerKind kind;
+    const char *op_passphrase = NULL;
+
+    if (!join_path (default_dir, sizeof (default_dir), panel->cwd, default_base))
+    {
+        set_status ("Path too long");
+        return false;
+    }
+
+    if (!prompt_input ("Extract zc container to dir: ", default_dir, dst_dir, sizeof (dst_dir)))
+    {
+        set_status ("zc container extract canceled");
+        return false;
+    }
+
+    if (!probe_zc_container_kind (src_path, &kind))
+    {
+        set_status ("Cannot inspect zc container %s: %s", display_name, strerror (errno));
+        return false;
+    }
+
+    passphrase[0] = '\0';
+    if (kind == ZC_CONTAINER_KIND_ENCRYPTED)
+    {
+        if (!prompt_secret ("Passphrase: ", passphrase, sizeof (passphrase)))
+        {
+            set_status ("zc container extract canceled");
+            secure_zero (passphrase, sizeof (passphrase));
+            return false;
+        }
+        op_passphrase = passphrase;
+    }
+
+    if (!extract_zc_container_file (src_path, dst_dir, op_passphrase))
+    {
+        set_status ("Cannot extract zc container %s: %s", display_name, container_error_or_errno ());
+        secure_zero (passphrase, sizeof (passphrase));
+        return false;
+    }
+
+    secure_zero (passphrase, sizeof (passphrase));
+    refresh_panels ();
+    set_status ("Extracted zc container to: %s", dst_dir);
+    return true;
+}
+
+static bool
+extract_selected_zc_container_in_active_panel (void)
+{
+    Panel *panel = &g_app.panels[g_app.active_panel];
+    size_t *indexes = NULL;
+    size_t count;
+    Entry *entry;
+    char src_path[PATH_MAX];
+    char default_base[PATH_MAX];
+    bool ok;
+
+    count = panel_collect_target_indexes (panel, &indexes);
+    if (count != 1)
+    {
+        free (indexes);
+        set_status ("zc container extract needs a single selected file");
+        return false;
+    }
+
+    entry = &panel->entries[indexes[0]];
+    if (entry->is_dir || !is_zc_container_path (entry->name))
+    {
+        free (indexes);
+        set_status ("Selection is not a zc container");
+        return false;
+    }
+
+    if (!entry_full_path (panel, entry, src_path, sizeof (src_path))
+        || !strip_zc_container_suffix (default_base, sizeof (default_base), entry->name))
+    {
+        free (indexes);
+        set_status ("Path too long");
+        return false;
+    }
+
+    ok = extract_zc_container_path_with_prompt (src_path, entry->name, default_base);
+    free (indexes);
+    return ok;
+}
+
+static bool
+create_plain_zc_container (Panel *panel, const size_t *indexes, size_t count, const char *dst_path)
+{
+    int fd = -1;
+    bool ok = false;
+
+    fd = open (dst_path, O_WRONLY | O_CREAT | O_EXCL | O_TRUNC, 0644);
+    if (fd == -1)
+        return false;
+
+    if (!write_zc_container_plain_magic (fd))
+        goto out;
+
+    for (size_t i = 0; i < count; i++)
+    {
+        Entry *entry = &panel->entries[indexes[i]];
+        char src_path[PATH_MAX];
+
+        if (!entry_full_path (panel, entry, src_path, sizeof (src_path))
+            || !append_path_to_zc_container (fd, src_path, entry->name))
+            goto out;
+    }
+
+    if (!write_zc_container_end_record (fd))
+        goto out;
+    ok = true;
+
+out:
+    close (fd);
+    if (!ok)
+        unlink (dst_path);
+    return ok;
+}
+
+static bool
+create_encrypted_zc_container (Panel *panel, const size_t *indexes, size_t count,
+                               const char *dst_path, const char *passphrase)
+{
+    int fd = -1;
+    ZcContainerItemList items;
+    AppendBuffer manifest;
+    unsigned char salt[ZC_SALT_LEN];
+    ZcEncryptedKeyset keys;
+    bool ok = false;
+    bool keys_ready = false;
+
+    clear_container_error ();
+    zc_container_item_list_init (&items);
+    ab_init (&manifest);
+    memset (&keys, 0, sizeof (keys));
+    memset (salt, 0, sizeof (salt));
+
+    for (size_t i = 0; i < count; i++)
+    {
+        Entry *entry = &panel->entries[indexes[i]];
+        char src_path[PATH_MAX];
+
+        if (!entry_full_path (panel, entry, src_path, sizeof (src_path))
+            || !collect_path_for_zc_container (&items, src_path, entry->name))
+            goto out;
+    }
+
+    if (!fill_random_bytes (salt, sizeof (salt))
+        || !derive_encrypted_keyset (passphrase, salt, ZC_ARGON2_ALGORITHM, ZC_ARGON2_BLOCKS,
+                                     ZC_ARGON2_PASSES, ZC_ARGON2_LANES, &keys)
+        || !serialize_encrypted_manifest (&items, &manifest))
+        goto out;
+    keys_ready = true;
+
+    fd = open (dst_path, O_WRONLY | O_CREAT | O_EXCL | O_TRUNC, 0644);
+    if (fd == -1)
+        goto out;
+
+    if (!write_zc_container_encrypted_magic (fd) || write_u32_le (fd, ZC_ARGON2_ALGORITHM) == -1
+        || write_u32_le (fd, ZC_ARGON2_BLOCKS) == -1 || write_u32_le (fd, ZC_ARGON2_PASSES) == -1
+        || write_u32_le (fd, ZC_ARGON2_LANES) == -1
+        || write_full (fd, salt, sizeof (salt)) == -1
+        || !encrypt_buffer_to_container (fd, (const unsigned char *) manifest.data, manifest.len,
+                                         keys.manifest_enc_key, keys.manifest_mac_key, "manifest"))
+        goto out;
+
+    for (size_t i = 0, payload_index = 0; i < items.len; i++)
+    {
+        ZcContainerItem *item = &items.items[i];
+        unsigned char enc_key[ZC_KEY_LEN];
+        unsigned char mac_key[ZC_KEY_LEN];
+
+        if (item->type == ZC_CONTAINER_RECORD_DIR)
+            continue;
+
+        derive_payload_keys (keys.payload_master_key, payload_index++, enc_key, mac_key);
+        if (item->type == ZC_CONTAINER_RECORD_FILE)
+            ok = encrypt_file_payload_to_container (fd, item->src_path, item->size, enc_key, mac_key,
+                                                    "payload");
+        else
+        {
+            char target[PATH_MAX];
+            ssize_t len = readlink (item->src_path, target, sizeof (target) - 1);
+
+            if (len < 0)
+                ok = false;
+            else
+            {
+                target[len] = '\0';
+                ok = encrypt_buffer_to_container (fd, (const unsigned char *) target, (size_t) len,
+                                                  enc_key, mac_key, "payload");
+                secure_zero (target, sizeof (target));
+            }
+        }
+        secure_zero (enc_key, sizeof (enc_key));
+        secure_zero (mac_key, sizeof (mac_key));
+        if (!ok)
+            goto out;
+    }
+
+    ok = true;
+
+out:
+    if (fd != -1)
+        close (fd);
+    if (!ok)
+        unlink (dst_path);
+    if (keys_ready)
+    {
+        secure_zero (&keys, sizeof (keys));
+    }
+    secure_zero (salt, sizeof (salt));
+    zc_container_item_list_free (&items);
+    if (manifest.data != NULL)
+    {
+        secure_zero (manifest.data, manifest.cap);
+        ab_free (&manifest);
+    }
+    return ok;
+}
+
+static void
+create_zc_container_in_active_panel (void)
+{
+    Panel *panel = &g_app.panels[g_app.active_panel];
+    size_t *indexes = NULL;
+    size_t count;
+    char dst_path[PATH_MAX];
+    char default_dst[PATH_MAX];
+    char passphrase[PROMPT_LEN];
+    char confirm[PROMPT_LEN];
+    bool encrypted;
+    bool ok;
+
+    count = panel_collect_target_indexes (panel, &indexes);
+    if (count == 0)
+    {
+        set_status ("Nothing to put into zc container");
+        return;
+    }
+    clear_container_error ();
+
+    if (count == 1)
+    {
+        int rc = snprintf (default_dst, sizeof (default_dst), "%s/%s%s", panel->cwd,
+                           panel->entries[indexes[0]].name, ZC_CONTAINER_EXT);
+        if (rc < 0 || (size_t) rc >= sizeof (default_dst))
+        {
+            free (indexes);
+            set_status ("Path too long");
+            return;
+        }
+    }
+    else if (!join_path (default_dst, sizeof (default_dst), panel->cwd, "container.zcc"))
+    {
+        free (indexes);
+        set_status ("Path too long");
+        return;
+    }
+
+    if (!prompt_input ("Create zc container: ", default_dst, dst_path, sizeof (dst_path)))
+    {
+        free (indexes);
+        set_status ("zc container creation canceled");
+        return;
+    }
+
+    if (!is_zc_container_path (dst_path))
+    {
+        set_status ("zc container name must end with %s", ZC_CONTAINER_EXT);
+        free (indexes);
+        return;
+    }
+
+    encrypted = prompt_confirm ("Create encrypted zc container?");
+    passphrase[0] = '\0';
+    confirm[0] = '\0';
+
+    if (encrypted)
+    {
+        if (!prompt_secret ("Passphrase: ", passphrase, sizeof (passphrase))
+            || !prompt_secret ("Confirm passphrase: ", confirm, sizeof (confirm)))
+        {
+            free (indexes);
+            secure_zero (passphrase, sizeof (passphrase));
+            secure_zero (confirm, sizeof (confirm));
+            set_status ("zc container creation canceled");
+            return;
+        }
+        if (passphrase[0] == '\0')
+        {
+            free (indexes);
+            secure_zero (passphrase, sizeof (passphrase));
+            secure_zero (confirm, sizeof (confirm));
+            set_status ("Passphrase cannot be empty");
+            return;
+        }
+        if (strcmp (passphrase, confirm) != 0)
+        {
+            free (indexes);
+            secure_zero (passphrase, sizeof (passphrase));
+            secure_zero (confirm, sizeof (confirm));
+            set_status ("Passphrases do not match");
+            return;
+        }
+    }
+
+    ok = encrypted ? create_encrypted_zc_container (panel, indexes, count, dst_path, passphrase)
+                   : create_plain_zc_container (panel, indexes, count, dst_path);
+    free (indexes);
+    secure_zero (passphrase, sizeof (passphrase));
+    secure_zero (confirm, sizeof (confirm));
+
+    if (!ok)
+    {
+        set_status ("Cannot create zc container %s: %s", dst_path, container_error_or_errno ());
+        return;
+    }
+
+    refresh_panels ();
+    set_status ("Created %s zc container: %s", encrypted ? "encrypted" : "plain", dst_path);
 }
 
 static bool
@@ -1995,7 +3876,14 @@ unpack_archive_in_active_panel (void)
     if (entry->is_dir)
     {
         free (indexes);
-        set_status ("Unpack works on archive files");
+        set_status ("Unpack works on archive or zc container files");
+        return;
+    }
+
+    if (is_zc_container_path (entry->name))
+    {
+        free (indexes);
+        (void) extract_selected_zc_container_in_active_panel ();
         return;
     }
 
@@ -2108,6 +3996,9 @@ open_selection (bool readonly)
         set_status ("Path too long");
         return false;
     }
+
+    if (is_zc_container_path (entry->name))
+        return extract_selected_zc_container_in_active_panel ();
 
     return spawn_kilo (path, readonly);
 }
@@ -2538,6 +4429,9 @@ handle_key (int key)
     case KEY_F2:
         pack_selection_in_active_panel ();
         break;
+    case KEY_F9:
+        create_zc_container_in_active_panel ();
+        break;
     case ' ':
         panel_toggle_selected_mark (panel);
         break;
@@ -2591,9 +4485,6 @@ handle_key (int key)
     case CTRL_KEY ('q'):
     case KEY_F10:
         g_app.running = false;
-        break;
-    case KEY_F9:
-        set_status ("F9 menu bar is not implemented");
         break;
     case 'r':
     case 'R':

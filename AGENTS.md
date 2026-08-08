@@ -28,6 +28,9 @@ This file describes how to work on this repository safely and consistently.
 - `make cosmo` is intended to build both `zc.com` and `zc-kilo.com`.
 - `make bundle-cosmo` is intended to produce the stable Cosmopolitan bundle layout under `dist/`.
 - Avoid introducing dependencies on `glib`, `ncurses`, `slang`, or other heavy runtime libraries.
+- Keep native `.zcc` container handling independent from external archive helpers.
+- Keep encrypted `.zcc` metadata hidden; names, paths, and metadata should not leak in cleartext.
+- Keep encrypted `.zcc` on a vendored cross-platform crypto backend, not host-specific libraries.
 
 ## Bundle Policy
 
@@ -53,9 +56,11 @@ Primary scope:
 Lower-priority or constrained scope:
 
 - pack/unpack commands may exist, but archive browsing stays out of scope
+- native `.zcc` containers are acceptable only as extract-first flows, not as browsable VFS in v1
+- encrypted `.zcc` should stay passphrase-per-operation in v1; no session key cache
 - no subshell
 - no remote VFS
-- no menu bar or user menu on `F9`
+- no menu bar or user menu; `F9` is available for native `zc` container creation
 - no background jobs
 - no separate internal editor/viewer beyond launching `zc-kilo`
 
@@ -82,6 +87,8 @@ Lower-priority or constrained scope:
 - Text-oriented convenience shortcuts may follow `kilo` conventions when they do not conflict badly.
 - Keep help text, README, and runtime footer consistent with the implemented keymap.
 - Keep archive support command-oriented: pack/unpack actions are fine, archive browsing is out of scope.
+- Keep native `.zcc` container behavior distinct from helper-backed generic archives.
+- Keep encrypted `.zcc` behavior aligned with the same extract-first model as plain `.zcc`.
 
 ## Validation
 

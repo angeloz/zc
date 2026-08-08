@@ -10,8 +10,9 @@ TARGET = zc
 BUNDLED_KILO = zc-kilo
 COSMO_TARGET = $(TARGET).com
 COSMO_BUNDLED_KILO = $(BUNDLED_KILO).com
-SRC = src/zc.c
+SRC = src/zc.c third_party/monocypher/monocypher.c
 KILO_DIR = third_party/kilo
+MONOCYPHER_DIR = third_party/monocypher
 DIST_DIR = dist
 BUNDLE_DIR = $(DIST_DIR)/zc-bundle
 COSMO_BUNDLE_DIR = $(DIST_DIR)/zc-cosmo-bundle
@@ -21,14 +22,14 @@ COSMO_BUNDLE_DIR = $(DIST_DIR)/zc-cosmo-bundle
 all: $(TARGET) $(BUNDLED_KILO)
 
 $(TARGET): $(SRC)
-	$(CC) $(ZC_CPPFLAGS) $(CFLAGS) -o $@ $(SRC) $(LDFLAGS)
+	$(CC) $(ZC_CPPFLAGS) -I$(MONOCYPHER_DIR) $(CFLAGS) -o $@ $(SRC) $(LDFLAGS)
 
 $(BUNDLED_KILO): $(KILO_DIR)/kilo.c $(KILO_DIR)/Makefile
 	$(MAKE) -C $(KILO_DIR) CC="$(CC)"
 	cp $(KILO_DIR)/kilo $@
 
 $(COSMO_TARGET): $(SRC)
-	$(COSMOCC) $(ZC_CPPFLAGS) $(CFLAGS) -o $@ $(SRC) $(LDFLAGS)
+	$(COSMOCC) $(ZC_CPPFLAGS) -I$(MONOCYPHER_DIR) $(CFLAGS) -o $@ $(SRC) $(LDFLAGS)
 
 $(COSMO_BUNDLED_KILO): $(KILO_DIR)/kilo.c
 	$(COSMOCC) $(CPPFLAGS) $(KILO_CFLAGS) -o $@ $(KILO_DIR)/kilo.c $(LDFLAGS)
