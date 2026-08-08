@@ -2,6 +2,29 @@
 
 `zc`, short for zero-commander, is a USB-first portable two-panel file commander. The intended distribution is a small bundle that can live on a removable drive, launch from that directory, and operate on the host machine's local filesystem without installation.
 
+**Portable file commander, portable archive tool, portable encrypted-backup tool.**
+
+`zc` is for the case where you want one small bundle you can keep locally or carry on a USB drive, launch in a terminal, and immediately use on the machine in front of you:
+
+- browse and edit the host filesystem
+- collect files into a native plain or encrypted `.zcc` container
+- prepare passphrase-protected portable archives or backups with modern crypto
+
+## Quick Start
+
+```sh
+make
+./zc
+```
+
+Portable bundle:
+
+```sh
+make bundle
+cd dist/zc-bundle
+./zc
+```
+
 ## Product Manifesto
 
 `zc` is not positioned as "just another Norton Commander or `mc` clone".
@@ -24,22 +47,6 @@ That means:
 
 In practice, `zc` is meant to be useful both as a local file commander and as a portable utility you can carry on a USB drive for file work, ad-hoc archives, and passphrase-protected backups.
 
-## Why `zc`
-
-- portable by design: move the whole bundle and run it again
-- bundle-relative behavior: editor and optional helpers resolve from the bundle layout first
-- native encrypted containers: `.zcc` can protect contents, names, paths, and metadata
-- modern crypto baseline: encrypted `.zcc` uses vendored Monocypher with passphrase-based authenticated encryption
-- focused scope: file work, text editing, packing/unpacking, and extract-first secure containers
-
-## Typical Use Cases
-
-- carry `zc` on a USB drive, plug into another machine, and work on that host filesystem without install steps
-- collect files from a host machine into one portable `.zcc` container
-- prepare an encrypted `.zcc` backup on removable storage protected by a passphrase
-- move a small self-contained toolbox with `zc` + `zc-kilo` for browsing, editing, copying, and recovery work
-- use `zc` locally as a compact two-panel commander without dragging in a larger runtime stack
-
 ## What Makes It Different
 
 - classic two-panel interaction, but with a portable-bundle-first product model
@@ -47,6 +54,12 @@ In practice, `zc` is meant to be useful both as a local file commander and as a 
 - modern passphrase-based protection for portable backups and archives
 - deterministic sibling-relative behavior for editor handoff and optional helper lookup
 - deliberate focus on field use, removable media, and host-machine operations
+
+## Three Primary Scenarios
+
+- **Portable host-file work**: keep `zc` on removable media, launch it on another machine, and work directly on that host filesystem without installation.
+- **Native secure containers**: collect files into a `.zcc` container, optionally encrypted so contents, names, paths, and metadata stay hidden without the passphrase.
+- **Small recovery/toolbox bundle**: carry `zc` and `zc-kilo` together as a compact operational bundle for browsing, copying, editing, and extracting on demand.
 
 ## Status
 
@@ -144,6 +157,8 @@ Rules:
 
 ## Build
 
+Standard build:
+
 ```sh
 make
 make bundle
@@ -168,6 +183,8 @@ This is intended to produce:
 - `./dist/zc-cosmo-bundle/`
 
 ## Run
+
+Examples:
 
 ```sh
 ./zc
