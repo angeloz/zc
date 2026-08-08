@@ -1,8 +1,8 @@
-# zc Documentation
+# zero-commander (`zc`) Documentation
 
 ## Overview
 
-`zc` is a compact two-panel file manager developed inside this repository as a new project, not as a port of `mc`. Its goal is to stay small, local, and portable while reusing a bundled `kilo`-derived editor binary for edit and view actions.
+`zc`, short for zero-commander, is a compact two-panel file manager developed inside this repository as a new project, not as a port of `mc`. Its goal is to stay small, local, and portable while reusing a bundled `kilo`-derived editor binary for edit and view actions.
 
 As of Saturday, August 8, 2026, the implemented scope is intentionally narrow:
 

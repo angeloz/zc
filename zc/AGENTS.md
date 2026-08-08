@@ -4,7 +4,7 @@ This file describes how to work on `zc/` safely and consistently.
 
 ## Project intent
 
-- `zc` is a lightweight, local-only two-panel file manager.
+- `zc`, short for zero-commander, is a lightweight, local-only two-panel file manager.
 - The design target is closer to `kilo` than to full `mc`.
 - Prefer small code, direct control flow, and limited features over broad abstraction.
 

@@ -1,6 +1,6 @@
-# zc
+# zero-commander (`zc`)
 
-`zc` is a small two-panel file manager built from scratch with a `kilo`-style bias toward low complexity.
+`zc`, short for zero-commander, is a small two-panel file manager built from scratch with a `kilo`-style bias toward low complexity.
 
 ## Goals
 

@@ -1134,7 +1134,7 @@ show_help_screen (void)
     ab_append_cstr (&ab, "\x1b[2J\x1b[H\x1b[?25l");
 
     row = 1;
-    ab_appendf (&ab, "\x1b[%d;1Hzc keymap", row++);
+    ab_appendf (&ab, "\x1b[%d;1Hzero-commander (zc) keymap", row++);
     row++;
     ab_appendf (&ab, "\x1b[%d;1HF1         Help", row++);
     ab_appendf (&ab, "\x1b[%d;1HEnter      Open file or enter directory", row++);
@@ -1907,7 +1907,7 @@ static void
 print_help (const char *argv0)
 {
     printf ("Usage: %s [path] [--left PATH --right PATH]\n", argv0);
-    printf ("Minimal two-panel file manager using external kilo.\n");
+    printf ("zero-commander (zc): minimal two-panel file manager using external kilo.\n");
 }
 
 static bool
@@ -1928,7 +1928,7 @@ parse_args (int argc, char **argv, char *left_path, size_t left_size, char *righ
         }
         if (strcmp (argv[i], "--version") == 0)
         {
-            printf ("zc %s\n", ZC_VERSION);
+            printf ("zero-commander (zc) %s\n", ZC_VERSION);
             exit (EXIT_SUCCESS);
         }
         if (strcmp (argv[i], "--left") == 0 && i + 1 < argc)
