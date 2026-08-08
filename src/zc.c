@@ -665,7 +665,12 @@ ensure_directory_exists (const char *path)
     char parent[PATH_MAX];
 
     if (stat (path, &st) == 0)
-        return S_ISDIR (st.st_mode);
+    {
+        if (S_ISDIR (st.st_mode))
+            return true;
+        errno = ENOTDIR;
+        return false;
+    }
     if (errno != ENOENT)
         return false;
 
@@ -681,7 +686,12 @@ ensure_directory_exists (const char *path)
     if (mkdir (path, 0755) == -1 && errno != EEXIST)
         return false;
 
-    return stat (path, &st) == 0 && S_ISDIR (st.st_mode);
+    if (stat (path, &st) == 0 && S_ISDIR (st.st_mode))
+        return true;
+
+    if (errno == 0)
+        errno = ENOTDIR;
+    return false;
 }
 
 static bool
@@ -696,6 +706,59 @@ ensure_parent_directory_exists (const char *path)
     }
 
     return ensure_directory_exists (parent);
+}
+
+static bool
+choose_default_output_dir (char *dst, size_t dst_size, const char *parent_dir, const char *base_name)
+{
+    struct stat st;
+    char candidate_name[PATH_MAX];
+    unsigned int attempt = 0;
+
+    while (true)
+    {
+        if (attempt == 0)
+        {
+            if (!copy_string (candidate_name, sizeof (candidate_name), base_name))
+            {
+                errno = ENAMETOOLONG;
+                return false;
+            }
+        }
+        else if (attempt == 1)
+        {
+            if (snprintf (candidate_name, sizeof (candidate_name), "%s-dir", base_name)
+                >= (int) sizeof (candidate_name))
+            {
+                errno = ENAMETOOLONG;
+                return false;
+            }
+        }
+        else if (snprintf (candidate_name, sizeof (candidate_name), "%s-dir-%u", base_name, attempt)
+                 >= (int) sizeof (candidate_name))
+        {
+            errno = ENAMETOOLONG;
+            return false;
+        }
+
+        if (!join_path (dst, dst_size, parent_dir, candidate_name))
+        {
+            errno = ENAMETOOLONG;
+            return false;
+        }
+
+        if (stat (dst, &st) == -1)
+        {
+            if (errno == ENOENT)
+                return true;
+            return false;
+        }
+
+        if (S_ISDIR (st.st_mode))
+            return true;
+
+        attempt++;
+    }
 }
 
 static int
@@ -2803,7 +2866,7 @@ draw_screen (const char *prompt_label, const char *prompt_value)
     else
     {
         snprintf (bottom_line, sizeof (bottom_line),
-                  "[F1] Help  [F2/Ctrl-P] Pack  [F9] ZC Container  [Ctrl-U] Unpack  [Ctrl-N] NewFile  [Space] Mark  [Tab] Switch  "
+                  "[F1] Help  [F2/Ctrl-P] Pack  [F9/Ctrl-E] ZC Container  [Ctrl-U] Unpack  [Ctrl-N] NewFile  [Space] Mark  [Tab] Switch  "
                   "[F3/F4] View/Edit  [F5/F6] Copy/Move  [F7] Mkdir  [F8] Delete  [F10/Ctrl-Q] Quit");
         ab_appendf (&ab, "%.*s", g_app.screen_cols, bottom_line);
     }
@@ -2925,7 +2988,7 @@ show_help_screen (void)
     ab_appendf (&ab, "\x1b[%d;1HF1         Help", row++);
     ab_appendf (&ab, "\x1b[%d;1HEnter      Open file or enter directory", row++);
     ab_appendf (&ab, "\x1b[%d;1HF2/Ctrl-P  Pack current item or selection", row++);
-    ab_appendf (&ab, "\x1b[%d;1HF9         Create plain/encrypted zc container", row++);
+    ab_appendf (&ab, "\x1b[%d;1HF9/Ctrl-E  Create plain/encrypted zc container", row++);
     ab_appendf (&ab, "\x1b[%d;1HF3         View with zc-kilo --readonly", row++);
     ab_appendf (&ab, "\x1b[%d;1HF4         Edit with zc-kilo", row++);
     ab_appendf (&ab, "\x1b[%d;1HF5         Copy", row++);
@@ -2939,7 +3002,7 @@ show_help_screen (void)
     ab_appendf (&ab, "\x1b[%d;1HSpace      Mark/unmark current entry", row++);
     ab_appendf (&ab, "\x1b[%d;1H*          Mark/unmark all entries", row++);
     ab_appendf (&ab, "\x1b[%d;1HTab        Switch panel", row++);
-    ab_appendf (&ab, "\x1b[%d;1Hr          Refresh", row++);
+    ab_appendf (&ab, "\x1b[%d;1Hr/Ctrl-R   Refresh", row++);
     ab_appendf (&ab, "\x1b[%d;1Hn          Rename single selected item", row++);
     row++;
     ab_appendf (&ab, "\x1b[%d;1HPress any key to return", row);
@@ -3198,7 +3261,7 @@ extract_zc_container_path_with_prompt (const char *src_path, const char *display
     ZcContainerKind kind;
     const char *op_passphrase = NULL;
 
-    if (!join_path (default_dir, sizeof (default_dir), panel->cwd, default_base))
+    if (!choose_default_output_dir (default_dir, sizeof (default_dir), panel->cwd, default_base))
     {
         set_status ("Path too long");
         return false;
@@ -3896,7 +3959,7 @@ unpack_archive_in_active_panel (void)
     }
 
     if (!strip_archive_suffix (unpack_name, sizeof (unpack_name), entry->name)
-        || !join_path (default_dir, sizeof (default_dir), panel->cwd, unpack_name))
+        || !choose_default_output_dir (default_dir, sizeof (default_dir), panel->cwd, unpack_name))
     {
         free (indexes);
         set_status ("Path too long");
@@ -4429,6 +4492,7 @@ handle_key (int key)
     case KEY_F2:
         pack_selection_in_active_panel ();
         break;
+    case CTRL_KEY ('e'):
     case KEY_F9:
         create_zc_container_in_active_panel ();
         break;
@@ -4488,6 +4552,7 @@ handle_key (int key)
         break;
     case 'r':
     case 'R':
+    case CTRL_KEY ('r'):
     case KEY_CTRL_L:
         refresh_panels ();
         set_status ("Refreshed");

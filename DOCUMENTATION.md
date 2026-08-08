@@ -201,7 +201,7 @@ Lower-priority or out-of-scope areas:
 
 - `F1`: help
 - `F2` / `Ctrl-P`: pack current item or marked set into an archive
-- `F9`: create a native plain or encrypted `zc` container from current item or marked set
+- `F9` / `Ctrl-E`: create a native plain or encrypted `zc` container from current item or marked set
 - `F3`: view
 - `F4`: edit
 - `F5`: copy
@@ -216,7 +216,7 @@ Lower-priority or out-of-scope areas:
 - `*`: toggle mark-all in active panel
 - `n`: rename one item
 - `Ctrl-U`: unpack one archive or extract one `.zcc` container into a chosen directory
-- `r`: refresh
+- `r` / `Ctrl-R`: refresh
 - `Enter`: open directory or file
 - `Backspace` / `-`: go to parent directory
 
@@ -285,7 +285,7 @@ Cosmopolitan validation:
 - no in-place browsing inside `.zcc` containers
 - no remote filesystems
 - no background jobs
-- no menu bar or user menu; `F9` is assigned to native `zc` container creation
+- no menu bar or user menu; `F9` and `Ctrl-E` are assigned to native `zc` container creation
 - no native internal editor/viewer separate from `zc-kilo`
 - no completed Windows support path yet
 - Cosmopolitan validation still depends on having `cosmocc` available in the build environment

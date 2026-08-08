@@ -95,9 +95,10 @@ Current implementation status is still narrower than the product direction:
 - `F6` move
 - `F7` create directory
 - `F8` delete after confirmation
-- `F9` create a native `zc` container (`.zcc`)
+- `F9` or `Ctrl-E` create a native `zc` container (`.zcc`)
 - `Ctrl-N` create empty file
 - `n` rename a single item
+- `r` or `Ctrl-R` refresh panels
 - `Space` toggle mark and advance
 - `*` mark or unmark all regular entries
 - `F10` or `Ctrl-Q` quit
@@ -110,8 +111,8 @@ Optional archive actions remain command-oriented only:
 
 `zc` also has a native extract-first container flow:
 
-- `F9` creates a `.zcc` container from the current item or marked selection
-- `F9` lets you choose between a plain or encrypted `.zcc` container
+- `F9` or `Ctrl-E` creates a `.zcc` container from the current item or marked selection
+- `F9` or `Ctrl-E` lets you choose between a plain or encrypted `.zcc` container
 - opening a `.zcc` file extracts it into a chosen host directory
 - `.zcc` creation/extraction is implemented directly in `zc`, without external archive helpers
 - encrypted `.zcc` containers require a passphrase on each extract/open operation
