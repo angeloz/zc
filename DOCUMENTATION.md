@@ -139,14 +139,18 @@ Archive and backup helper support is deliberately secondary under the USB-first 
 
 Current policy:
 
-- archive browsing remains out of scope
+- archive browsing and mounted archive views remain out of scope
 - pack/unpack may exist as explicit commands
 - Restic backup actions may exist as explicit commands
+- Restic repository browsing and FUSE mounting remain out of scope
 - helper resolution is deterministic: bundle `tools/` first, host `PATH` second
 - missing helpers produce explicit status messages that name the missing tool
 - native `.zcc` containers are not helper-backed and use a separate direct implementation
 
 This means helper-backed archive and backup support does not define the architecture. Core filesystem work does.
+It also keeps the runtime attack surface smaller: `zc` does not expose archives,
+backup repositories, or `.zcc` containers as mounted virtual filesystems during
+normal file-manager use.
 
 Helper names currently used by pack/unpack and backup code paths:
 
@@ -161,6 +165,9 @@ Helper names currently used by pack/unpack and backup code paths:
 ## Restic Backup Integration
 
 Restic support is command-oriented and local-repository-first. `zc` acts as a small launcher around the bundled or installed `restic` executable; it does not implement a Restic repository browser.
+This is intentional: mounted backup views increase the amount of backup material
+visible to the host while `zc` is running, so Restic operations stay explicit and
+short-lived.
 
 The Restic module opens with `Ctrl-B` and supports:
 
@@ -188,6 +195,7 @@ Ransomware recovery guidance:
 - `zc` is not a malware detector, endpoint hardening tool, or complete ransomware protection system
 - recommended use is an offline/removable repository, or a backend with immutability/object lock where available
 - the repository should be connected or mounted only for backup, restore, and `restic check`, then disconnected or unmounted
+- archive and backup storage should not remain mounted or browsable during routine file operations
 - users should periodically run `restic check` and test restores so backup availability is known before an incident
 - repository retention, pruning, immutability, access control, and remote backend setup remain Restic/backend/user policy
 - avoid placing the repository in the same directory tree or always-writable volume as the protected data
@@ -196,6 +204,7 @@ Out of scope:
 
 - repository browsing
 - FUSE mounting
+- mounted archive or backup views
 - scheduling
 - remote-backend setup UI
 

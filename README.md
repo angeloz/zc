@@ -108,7 +108,7 @@ Optional archive actions remain command-oriented only:
 
 - `F2` / `Ctrl-P` pack the current item or marked set
 - `Ctrl-U` unpack a selected archive into a chosen directory
-- archive browsing is out of scope
+- archive browsing and mounted archive views are deliberately out of scope
 
 Optional Restic backup actions are also command-oriented:
 
@@ -121,6 +121,11 @@ Optional Restic backup actions are also command-oriented:
 - repository passwords are handled by Restic, not stored or cached by `zc`
 - repository browsing, FUSE mount, scheduling, and remote-backend setup are out of scope for v1
 
+This is a deliberate attack-surface choice. `zc` avoids turning compressed
+archives, `.zcc` containers, or Restic repositories into mounted/browsable
+filesystems. Backup and archive operations stay explicit: pack, unpack, init,
+backup, list snapshots, restore, and check.
+
 Recommended ransomware-resilient usage:
 
 - keep the Restic repository on a removable disk, offline disk, or immutable/object-lock capable backend
@@ -128,6 +133,7 @@ Recommended ransomware-resilient usage:
 - disconnect or unmount the repository immediately after the operation
 - periodically run `restic check` and test restoring files before an incident
 - avoid keeping the repository in the same directory tree or always-writable volume as the data being protected
+- avoid keeping archive or backup storage mounted during normal file-manager work
 
 `zc` also has a native extract-first container flow:
 
