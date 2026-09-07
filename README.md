@@ -121,6 +121,14 @@ Optional Restic backup actions are also command-oriented:
 - repository passwords are handled by Restic, not stored or cached by `zc`
 - repository browsing, FUSE mount, scheduling, and remote-backend setup are out of scope for v1
 
+Recommended ransomware-resilient usage:
+
+- keep the Restic repository on a removable disk, offline disk, or immutable/object-lock capable backend
+- connect or mount the repository only for backup, restore, or `restic check`
+- disconnect or unmount the repository immediately after the operation
+- periodically run `restic check` and test restoring files before an incident
+- avoid keeping the repository in the same directory tree or always-writable volume as the data being protected
+
 `zc` also has a native extract-first container flow:
 
 - `F9` or `Ctrl-E` creates a `.zcc` container from the current item or marked selection

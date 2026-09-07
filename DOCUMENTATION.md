@@ -182,6 +182,16 @@ Password handling:
 - `zc` does not store, cache, or pass repository passwords
 - `zc` runs Restic in the foreground with raw mode disabled so Restic can prompt directly
 
+Ransomware recovery guidance:
+
+- Restic support helps reduce ransomware impact by making encrypted, versioned backups easier to run from `zc`
+- `zc` is not a malware detector, endpoint hardening tool, or complete ransomware protection system
+- recommended use is an offline/removable repository, or a backend with immutability/object lock where available
+- the repository should be connected or mounted only for backup, restore, and `restic check`, then disconnected or unmounted
+- users should periodically run `restic check` and test restores so backup availability is known before an incident
+- repository retention, pruning, immutability, access control, and remote backend setup remain Restic/backend/user policy
+- avoid placing the repository in the same directory tree or always-writable volume as the protected data
+
 Out of scope:
 
 - repository browsing
