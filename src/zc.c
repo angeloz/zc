@@ -2866,7 +2866,7 @@ draw_screen (const char *prompt_label, const char *prompt_value)
     else
     {
         snprintf (bottom_line, sizeof (bottom_line),
-                  "[F1] Help  [F2/Ctrl-P] Pack  [F9/Ctrl-E] ZC Container  [Ctrl-U] Unpack  [Ctrl-N] NewFile  [Space] Mark  [Tab] Switch  "
+                  "[F1] Help  [F2/Ctrl-P] Pack  [Ctrl-B] Restic  [F9/Ctrl-E] ZC Container  [Ctrl-U] Unpack  [Ctrl-N] NewFile  [Space] Mark  [Tab] Switch  "
                   "[F3/F4] View/Edit  [F5/F6] Copy/Move  [F7] Mkdir  [F8] Delete  [F10/Ctrl-Q] Quit");
         ab_appendf (&ab, "%.*s", g_app.screen_cols, bottom_line);
     }
@@ -2988,6 +2988,7 @@ show_help_screen (void)
     ab_appendf (&ab, "\x1b[%d;1HF1         Help", row++);
     ab_appendf (&ab, "\x1b[%d;1HEnter      Open file or enter directory", row++);
     ab_appendf (&ab, "\x1b[%d;1HF2/Ctrl-P  Pack current item or selection", row++);
+    ab_appendf (&ab, "\x1b[%d;1HCtrl-B     Restic backup module", row++);
     ab_appendf (&ab, "\x1b[%d;1HF9/Ctrl-E  Create plain/encrypted zc container", row++);
     ab_appendf (&ab, "\x1b[%d;1HF3         View with zc-kilo --readonly", row++);
     ab_appendf (&ab, "\x1b[%d;1HF4         Edit with zc-kilo", row++);
@@ -4035,6 +4036,294 @@ unpack_archive_in_active_panel (void)
 }
 
 static bool
+resolve_restic_tool (char *dst, size_t dst_size)
+{
+    if (resolve_optional_tool ("restic", dst, dst_size))
+        return true;
+
+    set_missing_optional_tool_status ("Restic", "restic");
+    return false;
+}
+
+static void
+pause_after_restic_command (void)
+{
+    const char *message = "\nPress any key to return to zc...";
+
+    write (STDOUT_FILENO, message, strlen (message));
+    (void) read_key ();
+}
+
+static void
+set_restic_status (const char *action, int rc)
+{
+    if (rc == 0)
+        set_status ("Restic %s complete", action);
+    else if (rc == 127)
+        set_status ("Restic %s failed: tool not found", action);
+    else if (rc == -1)
+        set_status ("Restic %s failed", action);
+    else
+        set_status ("Restic %s exited with status %d", action, rc);
+}
+
+static bool
+prompt_restic_repo (const char *default_repo, char *repo, size_t repo_size)
+{
+    if (!prompt_input ("Restic repo: ", default_repo, repo, repo_size))
+    {
+        set_status ("Restic canceled");
+        return false;
+    }
+    if (repo[0] == '\0')
+    {
+        set_status ("Restic repo is empty");
+        return false;
+    }
+    return true;
+}
+
+static void
+restic_init_repo (void)
+{
+    Panel *panel = &g_app.panels[g_app.active_panel];
+    char restic_cmd[PATH_MAX];
+    char repo[PATH_MAX];
+    char *argv[] = { restic_cmd, "--repo", repo, "init", NULL };
+    int rc;
+
+    if (!resolve_restic_tool (restic_cmd, sizeof (restic_cmd)))
+        return;
+    if (!prompt_restic_repo (panel->cwd, repo, sizeof (repo)))
+        return;
+
+    rc = run_child_process (NULL, argv, -1);
+    pause_after_restic_command ();
+    refresh_panels ();
+    set_restic_status ("init", rc);
+}
+
+static void
+restic_backup_selection (void)
+{
+    Panel *panel = &g_app.panels[g_app.active_panel];
+    Panel *dst_panel = &g_app.panels[1 - g_app.active_panel];
+    size_t *indexes = NULL;
+    char **argv = NULL;
+    char **owned_paths = NULL;
+    char restic_cmd[PATH_MAX];
+    char repo[PATH_MAX];
+    size_t count;
+    int rc;
+
+    count = panel_collect_target_indexes (panel, &indexes);
+    if (count == 0)
+    {
+        set_status ("Nothing to back up");
+        return;
+    }
+    if (!resolve_restic_tool (restic_cmd, sizeof (restic_cmd)))
+    {
+        free (indexes);
+        return;
+    }
+    if (!prompt_restic_repo (dst_panel->cwd, repo, sizeof (repo)))
+    {
+        free (indexes);
+        return;
+    }
+
+    argv = calloc (count + 6, sizeof (*argv));
+    owned_paths = calloc (count, sizeof (*owned_paths));
+    if (argv == NULL || owned_paths == NULL)
+        die ("calloc");
+
+    argv[0] = restic_cmd;
+    argv[1] = "--repo";
+    argv[2] = repo;
+    argv[3] = "backup";
+    argv[4] = "--";
+    for (size_t i = 0; i < count; i++)
+    {
+        char path[PATH_MAX];
+
+        if (!entry_full_path (panel, &panel->entries[indexes[i]], path, sizeof (path)))
+        {
+            for (size_t j = 0; j < i; j++)
+                free (owned_paths[j]);
+            free (owned_paths);
+            free (argv);
+            free (indexes);
+            set_status ("Path too long");
+            return;
+        }
+
+        owned_paths[i] = strdup (path);
+        if (owned_paths[i] == NULL)
+            die ("strdup");
+        argv[5 + i] = owned_paths[i];
+    }
+    argv[5 + count] = NULL;
+
+    rc = run_child_process (NULL, argv, -1);
+    pause_after_restic_command ();
+    for (size_t i = 0; i < count; i++)
+        free (owned_paths[i]);
+    free (owned_paths);
+    free (argv);
+    free (indexes);
+    refresh_panels ();
+    panel_clear_marks (panel);
+    set_restic_status ("backup", rc);
+}
+
+static void
+restic_list_snapshots (void)
+{
+    Panel *panel = &g_app.panels[g_app.active_panel];
+    char restic_cmd[PATH_MAX];
+    char repo[PATH_MAX];
+    char *argv[] = { restic_cmd, "--repo", repo, "snapshots", NULL };
+    int rc;
+
+    if (!resolve_restic_tool (restic_cmd, sizeof (restic_cmd)))
+        return;
+    if (!prompt_restic_repo (panel->cwd, repo, sizeof (repo)))
+        return;
+
+    rc = run_child_process (NULL, argv, -1);
+    pause_after_restic_command ();
+    set_restic_status ("snapshots", rc);
+}
+
+static void
+restic_restore_snapshot (void)
+{
+    Panel *dst_panel = &g_app.panels[1 - g_app.active_panel];
+    char restic_cmd[PATH_MAX];
+    char repo[PATH_MAX];
+    char snapshot[PROMPT_LEN];
+    char target[PATH_MAX];
+    char *argv[] = { restic_cmd, "--repo", repo, "restore", snapshot, "--target", target, NULL };
+    int rc;
+
+    if (!resolve_restic_tool (restic_cmd, sizeof (restic_cmd)))
+        return;
+    if (!prompt_restic_repo (dst_panel->cwd, repo, sizeof (repo)))
+        return;
+    if (!prompt_input ("Snapshot ID: ", "latest", snapshot, sizeof (snapshot)))
+    {
+        set_status ("Restic restore canceled");
+        return;
+    }
+    if (snapshot[0] == '\0')
+    {
+        set_status ("Snapshot ID is empty");
+        return;
+    }
+    if (!prompt_input ("Restore target: ", dst_panel->cwd, target, sizeof (target)))
+    {
+        set_status ("Restic restore canceled");
+        return;
+    }
+    if (target[0] == '\0')
+    {
+        set_status ("Restore target is empty");
+        return;
+    }
+
+    rc = run_child_process (NULL, argv, -1);
+    pause_after_restic_command ();
+    refresh_panels ();
+    set_restic_status ("restore", rc);
+}
+
+static void
+restic_check_repo (void)
+{
+    Panel *dst_panel = &g_app.panels[1 - g_app.active_panel];
+    char restic_cmd[PATH_MAX];
+    char repo[PATH_MAX];
+    char *argv[] = { restic_cmd, "--repo", repo, "check", NULL };
+    int rc;
+
+    if (!resolve_restic_tool (restic_cmd, sizeof (restic_cmd)))
+        return;
+    if (!prompt_restic_repo (dst_panel->cwd, repo, sizeof (repo)))
+        return;
+
+    rc = run_child_process (NULL, argv, -1);
+    pause_after_restic_command ();
+    refresh_panels ();
+    set_restic_status ("check", rc);
+}
+
+static void
+show_restic_menu_screen (void)
+{
+    AppendBuffer ab;
+    int row;
+
+    refresh_size ();
+    ab_init (&ab);
+    ab_append_cstr (&ab, "\x1b[2J\x1b[H\x1b[?25l");
+
+    row = 1;
+    ab_appendf (&ab, "\x1b[%d;1Hzero-commander (zc) restic module", row++);
+    row++;
+    ab_appendf (&ab, "\x1b[%d;1H1          Init local repository", row++);
+    ab_appendf (&ab, "\x1b[%d;1H2          Backup current item or marked selection", row++);
+    ab_appendf (&ab, "\x1b[%d;1H3          List snapshots", row++);
+    ab_appendf (&ab, "\x1b[%d;1H4          Restore snapshot", row++);
+    ab_appendf (&ab, "\x1b[%d;1H5          Check repository", row++);
+    ab_appendf (&ab, "\x1b[%d;1HEsc        Return", row++);
+    row++;
+    ab_appendf (&ab, "\x1b[%d;1HRepository passwords are handled by restic.", row++);
+    ab_append_cstr (&ab, "\x1b[?25h");
+
+    write (STDOUT_FILENO, ab.data, ab.len);
+    ab_free (&ab);
+}
+
+static void
+open_restic_menu (void)
+{
+    while (true)
+    {
+        int key;
+
+        show_restic_menu_screen ();
+        key = read_key ();
+        switch (key)
+        {
+        case '1':
+            restic_init_repo ();
+            return;
+        case '2':
+            restic_backup_selection ();
+            return;
+        case '3':
+            restic_list_snapshots ();
+            return;
+        case '4':
+            restic_restore_snapshot ();
+            return;
+        case '5':
+            restic_check_repo ();
+            return;
+        case KEY_ESCAPE:
+        case 'q':
+        case 'Q':
+            set_status ("Restic menu closed");
+            return;
+        default:
+            set_status ("Choose 1-5, or Esc");
+            break;
+        }
+    }
+}
+
+static bool
 open_selection (bool readonly)
 {
     Panel *panel = &g_app.panels[g_app.active_panel];
@@ -4491,6 +4780,9 @@ handle_key (int key)
     case CTRL_KEY ('p'):
     case KEY_F2:
         pack_selection_in_active_panel ();
+        break;
+    case CTRL_KEY ('b'):
+        open_restic_menu ();
         break;
     case CTRL_KEY ('e'):
     case KEY_F9:

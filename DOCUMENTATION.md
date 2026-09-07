@@ -64,8 +64,9 @@ That file currently contains:
 - prompt and confirmation flows
 - local filesystem operations
 - bundle-relative editor/helper discovery
-- process spawning for `zc-kilo` and optional archive tools
+- process spawning for `zc-kilo` and optional archive or backup tools
 - native `zc` container creation and extract-first reopening
+- command-oriented Restic backup integration
 
 The code should remain easy to trace without a large internal framework.
 
@@ -92,13 +93,13 @@ zc-cosmo-bundle/
 Bundle rules:
 
 - `zc` and `zc-kilo` live in the bundle root as siblings.
-- Optional helper executables live in `tools/`.
+- Optional helper executables, including archive tools and Restic, live in `tools/`.
 - `tools/` is part of the stable public layout even when empty.
 - `zc` resolves optional helpers from `tools/` before consulting host `PATH`.
 - Editor lookup is sibling-relative first.
 - Cosmopolitan editor lookup stays deterministic and does not fall back to `PATH`.
 
-At the moment, no archive helpers are bundled by default; the layout exists so a portable release can add them without changing runtime lookup rules.
+At the moment, no archive or backup helpers are bundled by default; the layout exists so a portable release can add them without changing runtime lookup rules.
 
 ## Native `zc` Container
 
@@ -134,19 +135,20 @@ If the required sibling editor is missing in forced-bundle mode, `zc` reports th
 
 ## Optional Helper Strategy
 
-Archive support is deliberately secondary under the USB-first model.
+Archive and backup helper support is deliberately secondary under the USB-first model.
 
 Current policy:
 
 - archive browsing remains out of scope
 - pack/unpack may exist as explicit commands
+- Restic backup actions may exist as explicit commands
 - helper resolution is deterministic: bundle `tools/` first, host `PATH` second
 - missing helpers produce explicit status messages that name the missing tool
 - native `.zcc` containers are not helper-backed and use a separate direct implementation
 
-This means archive support does not define the architecture. Core filesystem work does.
+This means helper-backed archive and backup support does not define the architecture. Core filesystem work does.
 
-Helper names currently used by pack/unpack code paths:
+Helper names currently used by pack/unpack and backup code paths:
 
 - `zip`
 - `bsdtar`
@@ -154,6 +156,38 @@ Helper names currently used by pack/unpack code paths:
 - `bzip2`
 - `xz`
 - `zstd`
+- `restic`
+
+## Restic Backup Integration
+
+Restic support is command-oriented and local-repository-first. `zc` acts as a small launcher around the bundled or installed `restic` executable; it does not implement a Restic repository browser.
+
+The Restic module opens with `Ctrl-B` and supports:
+
+- initialize a local repository with `restic init`
+- back up the current item or marked selection
+- list snapshots
+- restore a snapshot
+- run `restic check`
+
+Repository path handling:
+
+- every Restic action prompts for the repository path before execution
+- `restic init` and snapshot listing default to the active panel directory
+- backup, restore, and check use editable repository path prompts
+- restore separately prompts for snapshot ID and restore target
+
+Password handling:
+
+- `zc` does not store, cache, or pass repository passwords
+- `zc` runs Restic in the foreground with raw mode disabled so Restic can prompt directly
+
+Out of scope:
+
+- repository browsing
+- FUSE mounting
+- scheduling
+- remote-backend setup UI
 
 ## Host Terminal Expectations
 
@@ -188,11 +222,12 @@ Secondary workflows:
 
 - explicit pack/unpack commands
 - native extract-first plain/encrypted `.zcc` containers
+- command-oriented Restic backup actions
 
 Lower-priority or out-of-scope areas:
 
 - archive browsing
-- menu systems
+- general menu bar or user-menu systems
 - background jobs
 - plugin-like extensibility
 - features that introduce broad host runtime dependencies without a packaging plan
@@ -201,6 +236,7 @@ Lower-priority or out-of-scope areas:
 
 - `F1`: help
 - `F2` / `Ctrl-P`: pack current item or marked set into an archive
+- `Ctrl-B`: open the Restic backup module
 - `F9` / `Ctrl-E`: create a native plain or encrypted `zc` container from current item or marked set
 - `F3`: view
 - `F4`: edit
@@ -264,6 +300,8 @@ Dependency-isolation validation:
 
 - verify core file operations with no reliance on host `PATH`
 - verify archive helpers resolve from bundle `tools/` first
+- verify Restic resolves from bundle `tools/` first, then host `PATH`
+- verify Restic init and snapshot prompts default to the active panel directory
 - verify missing optional helpers fail with explicit status messaging
 - verify `.zcc` creation/extraction works without archive helper executables
 

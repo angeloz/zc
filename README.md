@@ -96,6 +96,7 @@ Current implementation status is still narrower than the product direction:
 - `F7` create directory
 - `F8` delete after confirmation
 - `F9` or `Ctrl-E` create a native `zc` container (`.zcc`)
+- `Ctrl-B` open the Restic backup module
 - `Ctrl-N` create empty file
 - `n` rename a single item
 - `r` or `Ctrl-R` refresh panels
@@ -108,6 +109,17 @@ Optional archive actions remain command-oriented only:
 - `F2` / `Ctrl-P` pack the current item or marked set
 - `Ctrl-U` unpack a selected archive into a chosen directory
 - archive browsing is out of scope
+
+Optional Restic backup actions are also command-oriented:
+
+- `Ctrl-B` opens a Restic module for local repository workflows
+- create a repository with `restic init`
+- back up the current item or marked selection
+- list snapshots, restore a snapshot, or run `restic check`
+- `zc` prompts for the repository path on each operation
+- `restic init` and snapshot listing default to the active panel directory
+- repository passwords are handled by Restic, not stored or cached by `zc`
+- repository browsing, FUSE mount, scheduling, and remote-backend setup are out of scope for v1
 
 `zc` also has a native extract-first container flow:
 
@@ -151,7 +163,7 @@ zc-cosmo-bundle/
 Rules:
 
 - `zc` and `zc-kilo` are sibling executables in the bundle root.
-- Optional helper executables such as `bsdtar`, `zip`, `gzip`, `bzip2`, `xz`, or `zstd` belong in `tools/`.
+- Optional helper executables such as `bsdtar`, `zip`, `gzip`, `bzip2`, `xz`, `zstd`, or `restic` belong in `tools/`.
 - `zc` checks `tools/` before host `PATH` for optional helper resolution.
 - Native builds may still use `ZC_KILO=/path/to/editor` to override the bundled editor.
 - Cosmopolitan builds keep deterministic sibling lookup and do not fall back to `PATH` for the editor.
